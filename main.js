@@ -91,7 +91,8 @@ const TEXT_ROLES = [
   { key: 'splitter', label: 'Splitter — splits oversized/complex tasks' },
   { key: 'healer', label: 'Healer — suggests fixes for failed tasks' },
   { key: 'lessoner', label: 'Lessoner — distills lessons from failures' },
-  { key: 'auditor', label: 'Auditor — reviews finished work (not yet wired)' },
+  { key: 'auditor', label: 'Auditor — reviews finished work against the master prompt' },
+  { key: 'analyzer', label: 'Analyzer — guesses file overlap for concurrent runs' },
 ];
 
 // The current "client:model" ref assigned to a role (from config).

@@ -24,6 +24,7 @@ import { setEnvKey } from './env.js';
 // Model-agnostic layer (see MODEL_AGNOSTIC_PLAN.md). Text stages go through
 // roles; worker execution is dispatched in execution/ (wired in P3).
 import { resolveRole } from './roles.js';
+import { runRole } from './roles/index.js';
 import { listModels } from './clients/index.js';
 import { getRolesConfig, getClientsConfig, CONTEXT_DIR, detectRateLimit } from './shared.js';
 import { execute } from './execution/index.js';
@@ -374,33 +375,6 @@ function workerModelMenu() {
   return { refs, menu, fallback: refs[0] || 'claude:sonnet' };
 }
 
-// The shared selection rule, so the plan and split prompts can't drift apart.
-//
-// Deliberately biased toward the reliable default rather than the cheapest
-// adequate one. The earlier "pick the cheapest that can code" rule routed a
-// whole run onto free models, and they failed for reasons a coding score cannot
-// predict: per-request token ceilings and tokens-per-minute throughput walls,
-// which surface as a task dying mid-run rather than as a bad answer. A free
-// model is worth it only when the task is genuinely small.
-const MODEL_CHOICE_RULES = [
-  'Choosing assigned_model — default to a "subscription" model (the Claude CLI).',
-  'It has no per-request ceiling and no rate-limit wall, so it is the safe choice',
-  'for any task that is long-running, reads large files, or must not fail midway.',
-  '',
-  'Assign a "free"/"free-tier" model ONLY when the task is clearly SMALL — a',
-  'single well-specified deliverable, touching few files, needing no large spec',
-  'read into context. When in doubt, it is not small: a task that dies halfway',
-  'through costs far more than it saved.',
-  '  - Respect "request budget": it is the hard ceiling on ONE request, and the',
-  '    running transcript (instructions + every file the worker reads) must fit',
-  '    inside it. Under ~16k tokens, only small self-contained tasks are safe;',
-  '    a model with no budget listed is either unconstrained (the Claude CLI) or',
-  '    simply unmeasured.',
-  '  - coding "strong" handles anything; "mid" suits mechanical or well-specified',
-  '    work; "light"/"weak" and "unrated" only for trivial, low-risk edits.',
-  'assigned_model MUST be exactly one of the quoted "client:model" strings above.',
-].join('\n');
-
 // ---------------------------------------------------------------------------
 // Route: POST /api/plan
 // ---------------------------------------------------------------------------
@@ -421,71 +395,19 @@ async function handlePlan(req, res) {
   // assign, so it never emits a model that can't actually run a task.
   const { menu, fallback } = workerModelMenu();
 
-  const planningPrompt = [
-    'You are a software planning assistant. Read the following MASTER PROMPT and',
-    'break it into an ordered list of concrete, independently-executable build tasks.',
-    '',
-    'Respond with ONE raw JSON array and NOTHING else — no prose, no markdown fences.',
-    'Each element MUST have exactly this shape:',
-    '{',
-    '  "id": "task-1",',
-    '  "description": "a single, self-contained instruction",',
-    '  "assigned_model": "<one of the models listed below>",',
-    '  "effort": "low" | "medium" | "high" | "ultracode",',
-    '  "depends_on": ["task-id", ...]',
-    '}',
-    '',
-    'Available models:',
-    menu,
-    '',
-    MODEL_CHOICE_RULES,
-    '',
-    'Rules: ids are sequential ("task-1", "task-2", ...). Use "depends_on" to encode',
-    'ordering. Match "effort" to task complexity (low for trivial work, high/ultracode',
-    'for complex work).',
-    '',
-    '=== MASTER PROMPT ===',
-    prompt,
-    '=== END MASTER PROMPT ===',
-  ].join('\n');
-
-  let stdout;
-  try {
-    stdout = await resolveRole('planner').complete(planningPrompt, { cwd: targetDir });
-  } catch (e) {
-    return sendJson(res, 500, {
-      error: 'The planner model failed while planning.',
-      detail: (e.message || '').toString(),
-      hint: 'Check config.json "roles.planner": is its client reachable (claude on PATH, or the provider API key env var set)?',
-    });
-  }
-
-  // Extract the first JSON array from the output.
-  const match = String(stdout).match(/\[[\s\S]*\]/);
-  if (!match) {
-    return sendJson(res, 502, {
-      error: 'Could not find a JSON task array in the model output.',
-      raw: String(stdout).slice(0, 4000),
-    });
-  }
   let tasks;
   try {
-    tasks = JSON.parse(match[0]);
+    tasks = await runRole('planner', { prompt, menu, fallback, cwd: targetDir });
   } catch (e) {
-    return sendJson(res, 502, {
-      error: 'Model returned malformed JSON.',
-      detail: e.message,
-      raw: match[0].slice(0, 4000),
+    return sendJson(res, e.raw ? 502 : 500, {
+      error: e.raw ? 'The planner did not return a valid task array.' : 'The planner model failed while planning.',
+      detail: (e.message || '').toString(),
+      raw: e.raw,
+      hint: e.raw
+        ? undefined
+        : 'Check config.json "roles.planner": is its client reachable (claude on PATH, or the provider API key env var set)?',
     });
   }
-  // Normalize + guard defaults.
-  tasks = (Array.isArray(tasks) ? tasks : []).map((t, i) => ({
-    id: t.id || `task-${i + 1}`,
-    description: t.description || '(no description)',
-    assigned_model: t.assigned_model || fallback,
-    effort: t.effort || 'medium',
-    depends_on: Array.isArray(t.depends_on) ? t.depends_on : [],
-  }));
   try {
     tasks = writeTasks(tasks);
   } catch (e) {
@@ -508,75 +430,24 @@ async function handleSplit(req, res) {
     return sendJson(res, 400, { error: 'No tasks to split. Generate a plan first.' });
   }
 
-  const { menu: splitMenu } = workerModelMenu();
+  const { menu, fallback } = workerModelMenu();
 
-  const prompt = [
-    "Split any task that would change >150 LOC, touches >3 modules, or has circular dependencies. Name sub-tasks as parentID.a, parentID.b, etc. Each sub-task must have a clear 'green test' criterion and explicit depends_on. Output expanded JSON.",
-    '',
-    'Leave tasks that do NOT need splitting exactly as they are. Every task in the',
-    'output MUST keep this JSON shape (add a "green_test" string on any task you split):',
-    '{',
-    '  "id": "task-1" | "task-1.a",',
-    '  "description": "…",',
-    '  "assigned_model": "<one of the models listed below>",',
-    '  "effort": "low" | "medium" | "high" | "ultracode",',
-    '  "depends_on": ["task-id", ...],',
-    '  "green_test": "how to know this sub-task is done (optional)"',
-    '}',
-    '',
-    'Available models:',
-    splitMenu,
-    '',
-    MODEL_CHOICE_RULES,
-    '',
-    'Respond with ONE raw JSON array and NOTHING else — no prose, no markdown fences.',
-    ...lessonsBlock(),
-    '',
-    '=== CURRENT TASKS (JSON) ===',
-    JSON.stringify(tasks, null, 2),
-    '=== END TASKS ===',
-  ].join('\n');
-
-  let out;
+  let expanded;
   try {
-    out = await resolveRole('splitter').complete(prompt, {
+    expanded = await runRole('splitter', {
+      tasks,
+      menu,
+      fallback,
+      lessons: lessonsBlock(),
       cwd: getConfig().targetDir || process.cwd(),
     });
   } catch (e) {
-    return sendJson(res, 500, {
-      error: 'The splitter model failed while splitting.',
+    return sendJson(res, e.raw ? 502 : 500, {
+      error: e.raw ? 'The splitter did not return a valid task array.' : 'The splitter model failed while splitting.',
       detail: e.message,
+      raw: e.raw,
     });
   }
-
-  const match = String(out).match(/\[[\s\S]*\]/);
-  if (!match) {
-    return sendJson(res, 502, {
-      error: 'Could not find a JSON task array in the splitter output.',
-      raw: String(out).slice(0, 4000),
-    });
-  }
-  let expanded;
-  try {
-    expanded = JSON.parse(match[0]);
-  } catch (e) {
-    return sendJson(res, 502, { error: 'Splitter returned malformed JSON.', detail: e.message });
-  }
-
-  // Normalize to the canonical task shape. We deliberately DROP any cached
-  // `files` annotation so the run-time isolation analysis re-runs over the new
-  // (possibly sub-divided) task set instead of using stale file lists.
-  expanded = (Array.isArray(expanded) ? expanded : []).map((t, i) => {
-    const norm = {
-      id: t.id || `task-${i + 1}`,
-      description: t.description || '(no description)',
-      assigned_model: t.assigned_model || workerModelMenu().fallback,
-      effort: t.effort || 'medium',
-      depends_on: Array.isArray(t.depends_on) ? t.depends_on : [],
-    };
-    if (t.green_test) norm.green_test = String(t.green_test);
-    return norm;
-  });
 
   try {
     expanded = writeTasks(expanded);
@@ -652,7 +523,7 @@ function handleGetModels(res) {
 // on the next stage call and the choice survives a restart. This is what makes a
 // non-Claude planner selectable from the UI instead of hand-editing config.json.
 // ---------------------------------------------------------------------------
-const TEXT_ROLES = new Set(['planner', 'splitter', 'healer', 'lessoner', 'auditor']);
+const TEXT_ROLES = new Set(['planner', 'splitter', 'healer', 'lessoner', 'auditor', 'analyzer']);
 async function handleSetRole(req, res) {
   const body = await readBody(req);
   const role = String(body.role || '').trim();
@@ -839,38 +710,7 @@ async function runAudit(cwd) {
   // a fresh autonomous build (all-new files) still shows up, unlike `git diff`.
   const changed = await gitChangedFiles(cwd);
 
-  const prompt = [
-    'You are a senior code auditor reviewing whether an autonomous build satisfied its requirements.',
-    'Review the MASTER PROMPT (requirements), the task plan with completion status, the per-task change',
-    'log, and the files changed in the working tree. Judge whether the work is complete and correct, and',
-    'flag gaps (unmet requirements, aborted tasks, no file changes where changes were expected).',
-    '',
-    'Respond with ONE raw JSON object and NOTHING else — no prose, no markdown fences:',
-    '{',
-    '  "verdict": "pass" | "partial" | "fail",',
-    '  "summary": "one short paragraph assessment",',
-    '  "issues": [ { "severity": "high"|"medium"|"low", "task": "task-id or general", "description": "...", "suggested_fix": "..." } ]',
-    '}',
-    '',
-    '=== MASTER PROMPT (requirements) ===',
-    master || '(none)',
-    '=== TASK PLAN & STATUS ===',
-    ...(taskLines.length ? taskLines : ['(no tasks)']),
-    '=== PER-TASK CHANGE LOG (session_context.md) ===',
-    sessionCtx || '(none)',
-    '=== FILES CHANGED IN WORKING TREE (git status) ===',
-    changed.length ? changed.join('\n') : '(none detected / not a git repo)',
-  ].join('\n');
-
-  const out = await resolveRole('auditor').complete(prompt, { cwd });
-  const match = String(out).match(/\{[\s\S]*\}/);
-  if (!match) throw new Error('Auditor did not return JSON. Raw: ' + String(out).slice(0, 500));
-  const parsed = JSON.parse(match[0]);
-  return {
-    verdict: parsed.verdict || 'unknown',
-    summary: parsed.summary || '',
-    issues: Array.isArray(parsed.issues) ? parsed.issues : [],
-  };
+  return runRole('auditor', { master, taskLines, sessionCtx, changed, cwd });
 }
 
 async function handleAudit(res) {
@@ -951,21 +791,11 @@ async function handleRetryTask(res, id) {
   }
 
   if (errorLog.trim()) {
-    const prompt = [
-      'The following task failed. Here is the error log. Fix the errors without',
-      'changing the intended behaviour. Output the corrected implementation plan or',
-      'code snippets needed. Do not rewrite the entire file unless necessary.',
-      '',
-      `TASK: ${tasks[idx].description}`,
-      '',
-      '=== ERROR LOG ===',
-      errorLog.slice(0, 12000),
-      '=== END ERROR LOG ===',
-    ].join('\n');
     try {
-      const out = await resolveRole('healer').complete(prompt);
-      suggested_fix = String(out).trim();
+      const heal = await runRole('healer', { taskId: id, description: tasks[idx].description, errorLog });
+      suggested_fix = heal.fix_summary || null;
       tasks[idx].suggested_fix = suggested_fix;
+      tasks[idx].suggested_fix_diagnosis = heal.diagnosis || undefined;
       writeTasks(tasks);
     } catch (e) {
       // Non-fatal: still un-abort so the user can retry manually. Report the
@@ -1263,36 +1093,16 @@ async function recordLesson(task) {
     return;
   }
 
-  const prompt = [
-    'A build task previously FAILED and has now been fixed and completed successfully.',
-    'Summarise what went wrong in this failed task and how it was fixed.',
-    'Output JSON: { error_summary, root_cause, fix, lesson }',
-    'Respond with ONE raw JSON object and NOTHING else — no prose, no markdown fences.',
-    '',
-    `TASK: ${task.description}`,
-    '',
-    '=== ERROR LOG ===',
-    errorLog.slice(0, 12000),
-    '=== END ERROR LOG ===',
-  ].join('\n');
-
   try {
-    const out = await resolveRole('lessoner').complete(prompt);
-    const match = String(out).match(/\{[\s\S]*\}/);
-    if (match) {
-      const parsed = JSON.parse(match[0]);
-      const mem = readMemory();
-      mem.push({
-        id: `mem-${Date.now()}`,
-        taskId: task.id,
-        error_summary: parsed.error_summary || '',
-        root_cause: parsed.root_cause || '',
-        fix: parsed.fix || '',
-        lesson: parsed.lesson || '',
-        created_at: new Date().toISOString(),
-      });
-      writeJson(FILES.memory, mem);
-    }
+    const lesson = await runRole('lessoner', { taskId: task.id, description: task.description, errorLog });
+    const mem = readMemory();
+    mem.push({
+      id: `mem-${Date.now()}`,
+      taskId: task.id,
+      ...lesson,
+      created_at: new Date().toISOString(),
+    });
+    writeJson(FILES.memory, mem);
   } catch {
     /* best-effort: a failed lesson write must not disrupt the run */
   }
@@ -1338,35 +1148,13 @@ async function analyzeFiles(tasks, cwd) {
   const need = tasks.filter((t) => !Array.isArray(t.files));
   if (need.length === 0) return tasks;
 
-  const prompt = [
-    'For each build task below, list the repository-relative file paths it will',
-    'CREATE or MODIFY. Be inclusive: include shared/barrel files (e.g. src/index.ts),',
-    'config files, and package.json when the task edits them — those are what decide',
-    'whether two tasks conflict. Judge from the task text alone; do not read the repo.',
-    '',
-    'Respond with ONE raw JSON array and NOTHING else — no prose, no fences:',
-    '[{ "id": "task-1", "files": ["path/a.ts", "path/b.ts"] }, ...]',
-    '',
-    '=== TASKS ===',
-    ...need.map((t) => `${t.id}: ${t.description}`),
-    '=== END TASKS ===',
-  ].join('\n');
-
-  let stdout;
+  let ann;
   try {
-    stdout = await resolveRole('analyzer').complete(prompt, { cwd });
+    ann = await runRole('analyzer', { tasks: need, cwd });
   } catch {
     return tasks; // best-effort: leave unannotated → scheduler runs tasks solo
   }
-  const match = String(stdout).match(/\[[\s\S]*\]/);
-  if (!match) return tasks;
-  let ann;
-  try {
-    ann = JSON.parse(match[0]);
-  } catch {
-    return tasks;
-  }
-  const byId = new Map((Array.isArray(ann) ? ann : []).map((a) => [a.id, a.files]));
+  const byId = new Map(ann.map((a) => [a.id, a.files]));
   for (const t of tasks) {
     if (!Array.isArray(t.files)) {
       const f = byId.get(t.id);

@@ -49,12 +49,17 @@ export const DEFAULT_CLIENTS = {
 
 // planner was previously hardwired to `fable` (now gone) → default to a live
 // Claude model so planning keeps working with zero configuration.
+//
+// analyzer is first-class (Phase 3) rather than silently inheriting the
+// planner's model — a cheap pass (file-isolation guessing), so it gets its
+// own light default instead of riding along on whatever the planner uses.
 export const DEFAULT_ROLES = {
   planner: { client: 'claude', model: 'sonnet' },
   splitter: { client: 'claude', model: 'opus' },
   healer: { client: 'claude', model: 'sonnet' },
   lessoner: { client: 'claude', model: 'sonnet' },
   auditor: { client: 'claude', model: 'opus' },
+  analyzer: { client: 'claude', model: 'sonnet' },
 };
 
 // ---------------------------------------------------------------------------

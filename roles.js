@@ -67,7 +67,9 @@ async function runWithFallback(perfRole, attempts, invoke) {
 
 export function resolveRole(name) {
   const roles = getRolesConfig();
-  // Unknown/unconfigured text roles (e.g. "analyzer") fall back to the planner.
+  // Every role in roles/index.js's registry has a DEFAULT_ROLES entry (see
+  // shared.js) as of Phase 3, so this only matters for a name that isn't a
+  // real role at all — falls back to the planner rather than hard-failing.
   const cfg = roles[name] || roles.planner || { client: 'claude', model: 'sonnet' };
   const { client: clientId, model, temperature, maxTokens } = cfg;
   const attempts = buildAttempts(cfg);
