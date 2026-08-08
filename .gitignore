@@ -1,0 +1,28 @@
+# Secrets — provider API keys live here, loaded into process.env at startup.
+# Never commit this. Use .env.example as the template.
+.env
+.env.local
+
+# Detached-launcher runtime (pids + logs from ./run.sh)
+.run/
+
+# Dependencies
+node_modules/
+
+# Runtime/state — regenerated at runtime, not source
+logs/
+error_logs/
+memory.json
+memory.*.json
+tasks.json
+completed.json
+aborted.json
+performance.json
+planner_chat.json
+session_context.md
+session_context.*.md
+mode.json
+config.json.bak
+*.bak
+*.bak-*
+.goutputstream-*

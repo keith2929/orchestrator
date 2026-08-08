@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Claude Orchestrator
+Comment=Start the claude-orchestrator backend + UI and open the browser
+Exec=bash -c "cd /media/sf_github/orchestrator && ./run.sh; echo; echo '(Servers keep running in the background. Close this window anytime. Run stop.sh to stop.)'; exec bash"
+Path=/media/sf_github/orchestrator
+Terminal=true
+Icon=applications-development
+Categories=Development;

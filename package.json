@@ -1,0 +1,16 @@
+{
+  "name": "claude-orchestrator",
+  "version": "1.0.0",
+  "description": "A GUI tool that orchestrates multi-step development tasks using the claude CLI.",
+  "type": "module",
+  "scripts": {
+    "server": "node server.js",
+    "client": "vite",
+    "dev": "node server.js & vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

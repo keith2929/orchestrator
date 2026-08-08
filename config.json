@@ -1,0 +1,357 @@
+{
+  "targetDir": "/media/sf_github/valuation-calc",
+  "clients": {
+    "claude": {
+      "kind": "cli",
+      "bin": "claude",
+      "models": [
+        {
+          "id": "opus",
+          "capabilities": {
+            "toolCalling": false,
+            "reasoning": true
+          },
+          "codingScore": 1,
+          "codingTier": "strong",
+          "codingProbedAt": "2026-07-28"
+        },
+        {
+          "id": "sonnet",
+          "capabilities": {
+            "toolCalling": false
+          },
+          "codingScore": 1,
+          "codingTier": "strong",
+          "codingProbedAt": "2026-07-28"
+        },
+        {
+          "id": "haiku",
+          "capabilities": {
+            "toolCalling": false
+          },
+          "codingScore": 1,
+          "codingTier": "strong",
+          "codingProbedAt": "2026-07-28"
+        }
+      ],
+      "costTier": "subscription"
+    },
+    "deepseek": {
+      "kind": "chat",
+      "baseURL": "https://api.deepseek.com/v1",
+      "apiKeyEnv": "DEEPSEEK_API_KEY",
+      "models": [
+        {
+          "id": "deepseek-v4-flash",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "blocked",
+          "accessNote": "no balance",
+          "cost": "paid"
+        },
+        {
+          "id": "deepseek-v4-pro",
+          "capabilities": {
+            "toolCalling": true,
+            "reasoning": true
+          },
+          "access": "blocked",
+          "accessNote": "no balance",
+          "cost": "paid"
+        }
+      ],
+      "costTier": "paid"
+    },
+    "openai": {
+      "kind": "chat",
+      "baseURL": "https://api.openai.com/v1",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "models": [
+        {
+          "id": "gpt-4o",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "blocked",
+          "accessNote": "needs billing",
+          "cost": "paid"
+        },
+        {
+          "id": "gpt-4o-mini",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "blocked",
+          "accessNote": "needs billing",
+          "cost": "paid"
+        }
+      ],
+      "costTier": "paid"
+    },
+    "gemini": {
+      "kind": "chat",
+      "baseURL": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "apiKeyEnv": "GEMINI_API_KEY",
+      "models": [
+        {
+          "id": "gemini-3.6-flash",
+          "capabilities": {
+            "toolCalling": true,
+            "reasoning": true
+          },
+          "access": "ok",
+          "cost": "free-tier",
+          "verifiedAt": "2026-07-29"
+        },
+        {
+          "id": "gemini-3.5-flash",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "verifiedAt": "2026-07-29",
+          "cost": "free-tier",
+          "access": "ok"
+        },
+        {
+          "id": "gemini-3.5-flash-lite",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "ok",
+          "cost": "free-tier",
+          "verifiedAt": "2026-07-29",
+          "codingScore": 1,
+          "codingTier": "strong",
+          "codingProbedAt": "2026-07-28"
+        },
+        {
+          "id": "gemini-3.1-flash-lite",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "ok",
+          "cost": "free-tier",
+          "verifiedAt": "2026-07-29",
+          "codingScore": 1,
+          "codingTier": "strong",
+          "codingProbedAt": "2026-07-28"
+        }
+      ],
+      "costTier": "free-tier"
+    },
+    "groq": {
+      "kind": "chat",
+      "baseURL": "https://api.groq.com/openai/v1",
+      "apiKeyEnv": "GROQ_API_KEY",
+      "models": [
+        {
+          "id": "llama-3.3-70b-versatile",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "ok",
+          "cost": "free-tier",
+          "verifiedAt": "2026-07-29",
+          "codingScore": 0.8,
+          "codingTier": "mid",
+          "codingProbedAt": "2026-07-28",
+          "codingRuns": 3,
+          "limits": {
+            "contextTokens": 131072,
+            "maxOutputTokens": 32768,
+            "tokensPerWindow": 12000,
+            "tokenWindow": "250ms",
+            "requestsPerWindow": 1000,
+            "requestWindow": "1m26.4s",
+            "effectiveRequestTokens": 12000,
+            "budgetBasis": "measured"
+          }
+        },
+        {
+          "id": "llama-3.1-8b-instant",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "ok",
+          "cost": "free-tier",
+          "verifiedAt": "2026-07-29",
+          "codingScore": 0.7,
+          "codingTier": "mid",
+          "codingProbedAt": "2026-07-28",
+          "codingRuns": 3,
+          "limits": {
+            "contextTokens": 131072,
+            "maxOutputTokens": 131072,
+            "tokensPerWindow": 6000,
+            "tokenWindow": "500ms",
+            "requestsPerWindow": 14400,
+            "requestWindow": "6s",
+            "effectiveRequestTokens": 6000,
+            "budgetBasis": "measured"
+          }
+        },
+        {
+          "id": "openai/gpt-oss-120b",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "ok",
+          "cost": "free-tier",
+          "verifiedAt": "2026-07-29",
+          "codingScore": 1,
+          "codingTier": "strong",
+          "codingProbedAt": "2026-07-28",
+          "codingRuns": 3,
+          "limits": {
+            "contextTokens": 131072,
+            "maxOutputTokens": 65536,
+            "tokensPerWindow": 8000,
+            "tokenWindow": "644ms",
+            "requestsPerWindow": 1000,
+            "requestWindow": "1m26.4s",
+            "effectiveRequestTokens": 8000,
+            "budgetBasis": "measured"
+          }
+        },
+        {
+          "id": "openai/gpt-oss-20b",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "ok",
+          "cost": "free-tier",
+          "verifiedAt": "2026-07-29",
+          "codingScore": 1,
+          "codingTier": "strong",
+          "codingProbedAt": "2026-07-28",
+          "codingRuns": 3,
+          "limits": {
+            "contextTokens": 131072,
+            "maxOutputTokens": 65536,
+            "tokensPerWindow": 8000,
+            "tokenWindow": "615ms",
+            "requestsPerWindow": 1000,
+            "requestWindow": "1m26.4s",
+            "effectiveRequestTokens": 8000,
+            "budgetBasis": "measured"
+          }
+        },
+        {
+          "id": "qwen/qwen3.6-27b",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "ok",
+          "cost": "free-tier",
+          "verifiedAt": "2026-07-29",
+          "limits": {
+            "contextTokens": 131072,
+            "maxOutputTokens": 16384,
+            "tokensPerWindow": 8000,
+            "tokenWindow": "187ms",
+            "requestsPerWindow": 1000,
+            "requestWindow": "1m26.4s",
+            "effectiveRequestTokens": 8000,
+            "budgetBasis": "measured"
+          }
+        }
+      ],
+      "costTier": "free-tier"
+    },
+    "openrouter": {
+      "kind": "chat",
+      "baseURL": "https://openrouter.ai/api/v1",
+      "apiKeyEnv": "OPENROUTER_API_KEY",
+      "models": [
+        {
+          "id": "nvidia/nemotron-3-super-120b-a12b:free",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "ok",
+          "cost": "free",
+          "verifiedAt": "2026-07-29",
+          "codingScore": 0.7,
+          "codingTier": "mid",
+          "codingProbedAt": "2026-07-28",
+          "limits": {
+            "contextTokens": 262144,
+            "maxOutputTokens": 262144,
+            "effectiveRequestTokens": 262144,
+            "budgetBasis": "catalogue"
+          }
+        },
+        {
+          "id": "google/gemma-4-31b-it:free",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "ok",
+          "cost": "free",
+          "verifiedAt": "2026-07-28"
+        },
+        {
+          "id": "openai/gpt-oss-120b",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "blocked",
+          "accessNote": "no balance",
+          "cost": "paid"
+        },
+        {
+          "id": "deepseek/deepseek-chat",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "blocked",
+          "accessNote": "no balance",
+          "cost": "paid"
+        },
+        {
+          "id": "google/gemini-2.5-flash",
+          "capabilities": {
+            "toolCalling": true
+          },
+          "access": "blocked",
+          "accessNote": "no balance",
+          "cost": "paid"
+        },
+        {
+          "id": "anthropic/claude-sonnet-4.5",
+          "capabilities": {
+            "toolCalling": true,
+            "reasoning": true
+          },
+          "access": "blocked",
+          "accessNote": "no balance",
+          "cost": "paid"
+        }
+      ]
+    }
+  },
+  "roles": {
+    "planner": {
+      "client": "claude",
+      "model": "opus",
+      "fallback": "claude:sonnet"
+    },
+    "splitter": {
+      "client": "claude",
+      "model": "opus"
+    },
+    "healer": {
+      "client": "claude",
+      "model": "sonnet"
+    },
+    "lessoner": {
+      "client": "claude",
+      "model": "sonnet"
+    },
+    "auditor": {
+      "client": "claude",
+      "model": "opus"
+    }
+  }
+}
