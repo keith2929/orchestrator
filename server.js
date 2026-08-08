@@ -66,7 +66,6 @@ const STATE_FILENAMES = {
   running: 'running.json', // Feature 2: persistent "Running"
   sessionContext: 'session_context.md', // Feature 4: stitching
   memory: 'memory.json', // Feature 6: lessons learned
-  mode: 'mode.json', // Run mode: "sequential" | "concurrent"
   plannerChat: 'planner_chat.json', // Durable "chat with the planner" transcript
 };
 
@@ -103,12 +102,11 @@ const FILES = new Proxy(
   }
 );
 
-// Run modes. Sequential (the default) runs tasks strictly in plan order, one at
-// a time — the reliable choice, since it never violates a hidden ordering
-// dependency the depends_on graph didn't capture. Concurrent keeps the original
-// DAG/parallel scheduler.
-const RUN_MODES = new Set(['sequential', 'concurrent']);
-const DEFAULT_MODE = 'sequential';
+// Default ceiling on tasks in flight at once. config.json "maxConcurrency" (or
+// $CONCURRENCY) overrides it; 1 reproduces the old "sequential" behaviour
+// exactly, since the unified scheduler's depsMet check is what used to be
+// concurrent-mode-only logic (see REDESIGN_PLAN.md Phase 2).
+const DEFAULT_MAX_CONCURRENCY = 3;
 
 // Per-task artefacts. error_logs/{id}.txt drives self-healing retry (Feature 3)
 // and lesson capture (Feature 6); logs/{id}.log is the full tee'd run log
@@ -176,16 +174,67 @@ function writeJson(file, data) {
 function getConfig() {
   return readJson(FILES.config, { targetDir: process.cwd() });
 }
-// Current run mode, defaulting to sequential and tolerating a missing/garbled
-// mode.json or an unknown value.
-function getMode() {
-  const m = readJson(FILES.mode, {});
-  return RUN_MODES.has(m && m.mode) ? m.mode : DEFAULT_MODE;
+
+// ---------------------------------------------------------------------------
+// Topological order enforcement (Phase 2). The old "sequential" scheduler ran
+// tasks.json in pure array order and ignored depends_on; the unified scheduler
+// always follows depends_on, so the array itself must never disagree with the
+// graph it stores — this is what makes the visible task list order match
+// execution order. Every write path that can add tasks or change depends_on
+// goes through writeTasks(), which re-derives array order from the graph and
+// rejects a dangling reference or a cycle rather than persisting a plan the
+// scheduler could get stuck on.
+// ---------------------------------------------------------------------------
+function topoSortTasks(tasks) {
+  const byId = new Map(tasks.map((t) => [t.id, t]));
+  for (const t of tasks) {
+    for (const dep of t.depends_on || []) {
+      if (!byId.has(dep)) {
+        throw new Error(`Task "${t.id}" depends_on unknown task "${dep}".`);
+      }
+    }
+  }
+  const visited = new Set();
+  const visiting = new Set();
+  const ordered = [];
+  function visit(t) {
+    if (visited.has(t.id)) return;
+    if (visiting.has(t.id)) {
+      throw new Error(`Circular dependency involving "${t.id}".`);
+    }
+    visiting.add(t.id);
+    for (const dep of t.depends_on || []) visit(byId.get(dep));
+    visiting.delete(t.id);
+    visited.add(t.id);
+    ordered.push(t);
+  }
+  // Preserve original relative order among tasks with no ordering constraint
+  // between them — only reorder when depends_on actually forces it.
+  for (const t of tasks) visit(t);
+  return ordered;
 }
-function setMode(mode) {
-  const safe = RUN_MODES.has(mode) ? mode : DEFAULT_MODE;
-  writeJson(FILES.mode, { mode: safe });
-  return safe;
+function writeTasks(tasks) {
+  const ordered = topoSortTasks(tasks);
+  writeJson(FILES.tasks, ordered);
+  return ordered;
+}
+
+// Shared completed/aborted bookkeeping — was duplicated 3+ times across the
+// old sequential/concurrent branches and handleRunOne (see REDESIGN_PLAN.md
+// Phase 2 duplication inventory).
+function markTaskAborted(id) {
+  const arr = readJson(FILES.aborted, []);
+  if (!arr.includes(id)) {
+    arr.push(id);
+    writeJson(FILES.aborted, arr);
+  }
+}
+function markTaskCompleted(id) {
+  const arr = readJson(FILES.completed, []);
+  if (!arr.includes(id)) {
+    arr.push(id);
+    writeJson(FILES.completed, arr);
+  }
 }
 
 // One-shot LLM calls used by the planner-adjacent features (split, self-healing
@@ -437,7 +486,11 @@ async function handlePlan(req, res) {
     effort: t.effort || 'medium',
     depends_on: Array.isArray(t.depends_on) ? t.depends_on : [],
   }));
-  writeJson(FILES.tasks, tasks);
+  try {
+    tasks = writeTasks(tasks);
+  } catch (e) {
+    return sendJson(res, 502, { error: 'Planner produced an invalid task graph.', detail: e.message });
+  }
   writeJson(FILES.completed, []);
   writeJson(FILES.aborted, []);
   sendJson(res, 200, { tasks, completed: [], aborted: [], targetDir });
@@ -525,7 +578,11 @@ async function handleSplit(req, res) {
     return norm;
   });
 
-  writeJson(FILES.tasks, expanded);
+  try {
+    expanded = writeTasks(expanded);
+  } catch (e) {
+    return sendJson(res, 502, { error: 'Splitter produced an invalid task graph.', detail: e.message });
+  }
   sendJson(res, 200, { tasks: expanded });
 }
 
@@ -570,7 +627,7 @@ function handleGetTasks(res) {
     completed,
     aborted,
     running,
-    mode: getMode(),
+    maxConcurrency: Math.max(1, Number(getConfig().maxConcurrency) || DEFAULT_MAX_CONCURRENCY),
     targetDir: getConfig().targetDir,
   });
 }
@@ -756,7 +813,7 @@ function handleDeletePlannerChat(res) {
 // using the auditor role. Inputs: MASTER_PROMPT (requirements), the task plan +
 // completion status, the per-task change log (session_context.md), and a bounded
 // working-tree diff. Returns a structured verdict. Manual via POST /api/audit;
-// auto-runs at end of a sequential run when config.autoAudit is true.
+// auto-runs at end of a run when config.autoAudit is true.
 // ---------------------------------------------------------------------------
 async function runAudit(cwd) {
   let master = '';
@@ -830,19 +887,18 @@ async function handleAudit(res) {
 }
 
 // ---------------------------------------------------------------------------
-// Route: POST /api/mode  — set the global run mode.
-// Body: { mode: "sequential" | "concurrent" }.
+// Route: POST /api/concurrency — set the max tasks in flight at once.
+// Body: { maxConcurrency: number }. 1 reproduces the old "sequential" mode;
+// there is no longer a separate scheduler to switch to (see Phase 2).
 // ---------------------------------------------------------------------------
-async function handleSetMode(req, res) {
+async function handleSetConcurrency(req, res) {
   const body = await readBody(req);
-  const requested = (body.mode || '').trim();
-  if (!RUN_MODES.has(requested)) {
-    return sendJson(res, 400, {
-      error: 'Invalid "mode". Expected "sequential" or "concurrent".',
-    });
+  const n = Math.floor(Number(body.maxConcurrency));
+  if (!Number.isFinite(n) || n < 1) {
+    return sendJson(res, 400, { error: '"maxConcurrency" must be a whole number >= 1.' });
   }
-  const mode = setMode(requested);
-  sendJson(res, 200, { mode });
+  writeJson(FILES.config, { ...readJson(FILES.config, {}), maxConcurrency: n });
+  sendJson(res, 200, { maxConcurrency: n });
 }
 
 // ---------------------------------------------------------------------------
@@ -858,8 +914,13 @@ async function handlePutTask(req, res, id) {
   for (const key of allowed) {
     if (key in patch) tasks[idx][key] = patch[key];
   }
-  writeJson(FILES.tasks, tasks);
-  sendJson(res, 200, { task: tasks[idx] });
+  let ordered;
+  try {
+    ordered = writeTasks(tasks);
+  } catch (e) {
+    return sendJson(res, 400, { error: 'Edit would produce an invalid task graph.', detail: e.message });
+  }
+  sendJson(res, 200, { task: ordered.find((t) => t.id === id) });
 }
 
 // ---------------------------------------------------------------------------
@@ -905,13 +966,13 @@ async function handleRetryTask(res, id) {
       const out = await resolveRole('healer').complete(prompt);
       suggested_fix = String(out).trim();
       tasks[idx].suggested_fix = suggested_fix;
-      writeJson(FILES.tasks, tasks);
+      writeTasks(tasks);
     } catch (e) {
       // Non-fatal: still un-abort so the user can retry manually. Report the
       // hiccup so it isn't silently swallowed.
       suggested_fix = null;
       tasks[idx].suggested_fix_error = e.message;
-      writeJson(FILES.tasks, tasks);
+      writeTasks(tasks);
     }
   }
 
@@ -993,22 +1054,14 @@ async function handleRunOne(res, id) {
   }
 
   if (!ok) {
-    const arr = readJson(FILES.aborted, []);
-    if (!arr.includes(id)) {
-      arr.push(id);
-      writeJson(FILES.aborted, arr);
-    }
+    markTaskAborted(id);
     sse(res, {
       type: 'task-aborted',
       id: task.id,
       message: `❌ ${task.id} could not be completed — marked aborted.`,
     });
   } else {
-    const comp = readJson(FILES.completed, []);
-    if (!comp.includes(id)) {
-      comp.push(id);
-      writeJson(FILES.completed, comp);
-    }
+    markTaskCompleted(id);
     sse(res, { type: 'task-complete', id: task.id, message: `✅ ${task.id} done.` });
     await appendSessionContext(task.id, cwd);
     await recordLesson(task);
@@ -1320,7 +1373,7 @@ async function analyzeFiles(tasks, cwd) {
       t.files = Array.isArray(f) ? f.map(String) : [];
     }
   }
-  writeJson(FILES.tasks, tasks);
+  writeTasks(tasks);
   return tasks;
 }
 
@@ -1508,6 +1561,16 @@ function runTask(task, cwd, res) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// The run loop. Unified in Phase 2: there is one scheduler, built on what was
+// previously "concurrent mode"'s depsMet logic — it always follows the real
+// depends_on graph (re-read fresh each iteration), never array position.
+// maxConcurrency=1 reproduces the old "sequential" guarantee (one task at a
+// time, real dependency order) without a second code path; the old sequential
+// mode's bug was that it used array position INSTEAD of depends_on, which
+// silently diverged from the graph the moment a UI edit, a re-split, or the
+// planner emitted tasks out of topological order (see REDESIGN_PLAN.md).
+// ---------------------------------------------------------------------------
 async function handleRun(res) {
   setCors(res);
   res.writeHead(200, {
@@ -1518,9 +1581,13 @@ async function handleRun(res) {
 
   const cfg = getConfig();
   const cwd = cfg.targetDir || process.cwd();
-  // Max tasks in flight at once. Tasks only actually run in parallel when their
-  // file sets are disjoint (see below); this is just the ceiling.
-  const maxConc = Math.max(1, Number(process.env.CONCURRENCY) || Number(cfg.maxConcurrency) || 3);
+  // Max tasks in flight at once. Tasks only actually run in parallel when
+  // their file sets are disjoint (see below) — this is just the ceiling. 1
+  // means strictly one at a time, in dependency order.
+  const maxConc = Math.max(
+    1,
+    Number(process.env.CONCURRENCY) || Number(cfg.maxConcurrency) || DEFAULT_MAX_CONCURRENCY
+  );
 
   let clientGone = false;
   res.on('close', () => {
@@ -1543,160 +1610,20 @@ async function handleRun(res) {
     return;
   }
 
-  const mode = getMode();
-
-  // -------------------------------------------------------------------------
-  // SEQUENTIAL MODE (default): run tasks strictly in plan.json order, one at a
-  // time. We deliberately IGNORE the depends_on graph for scheduling — insertion
-  // order is the intended ordering — so a late "repo hygiene / build" task can
-  // never fire before the earlier tasks that actually make the build pass.
-  // -------------------------------------------------------------------------
-  if (mode === 'sequential') {
-    sse(res, {
-      type: 'status',
-      message: `Starting run in ${cwd} — 🧭 Sequential mode (one task at a time, in plan order)`,
-    });
-
-    const abortedSet = new Set(readJson(FILES.aborted, []));
-    const markAborted = (id) => {
-      abortedSet.add(id);
-      const arr = readJson(FILES.aborted, []);
-      if (!arr.includes(id)) {
-        arr.push(id);
-        writeJson(FILES.aborted, arr);
-      }
-    };
-
-    // Tasks passed over because a previous run marked them aborted, and the
-    // provider limit (if any) that cut this run short.
-    const skipped = [];
-    let haltedBy = null;
-
-    // Snapshot the task order once; iterate in array order.
-    const orderedTasks = readJson(FILES.tasks, []);
-    for (let i = 0; i < orderedTasks.length; i++) {
-      if (clientGone) break;
-      const task = orderedTasks[i];
-
-      // Re-read completion each iteration so a task completed in a previous run
-      // (or manually) is skipped rather than re-run.
-      const completed = new Set(readJson(FILES.completed, []));
-      if (completed.has(task.id)) continue;
-
-      // aborted.json persists across runs and a new run does NOT clear it, so an
-      // aborted task stays skipped until it is explicitly retried. Say that out
-      // loud: skipping in silence is why "Run All Pending" could look like it
-      // did nothing at all.
-      if (abortedSet.has(task.id)) {
-        skipped.push(task.id);
-        sse(res, {
-          type: 'task-skipped',
-          id: task.id,
-          message: `⏭️ ${task.id} skipped — aborted by an earlier run. Use ↻ on the task (or Retry All) to make it pending again.`,
-        });
-        continue;
-      }
-
-      sse(res, {
-        type: 'task-start',
-        id: task.id,
-        message: `▶️ [${i + 1}/${orderedTasks.length}] ${task.id} — ${task.description} [${task.assigned_model}/${task.effort}]`,
-      });
-
-      // Wait for this task to fully finish (Done or Aborted) before the next.
-      const { ok, rateLimited } = await runTask(task, cwd, res);
-      if (clientGone) break;
-
-      // A provider limit makes every subsequent task fail instantly for the same
-      // reason. Stop the run and leave this task and the rest PENDING — marking
-      // them aborted would burn the whole queue in seconds and then have later
-      // runs skip them all.
-      if (rateLimited) {
-        haltedBy = rateLimited;
-        sse(res, {
-          type: 'paused',
-          message: `⏸️ ${task.id} did not run — ${rateLimited.reason}`,
-        });
-        break;
-      }
-
-      if (!ok) {
-        markAborted(task.id);
-        sse(res, {
-          type: 'task-aborted',
-          id: task.id,
-          message: `❌ ${task.id} could not be completed — marked aborted. Continuing with the next task.`,
-        });
-        continue;
-      }
-
-      const comp = readJson(FILES.completed, []);
-      if (!comp.includes(task.id)) {
-        comp.push(task.id);
-        writeJson(FILES.completed, comp);
-      }
-      sse(res, { type: 'task-complete', id: task.id, message: `✅ ${task.id} done.` });
-
-      // Feature 4 + 6: same post-completion bookkeeping as concurrent mode.
-      await appendSessionContext(task.id, cwd);
-      await recordLesson(task);
-    }
-
-    // P5: optional Auditor pass at the end of the pipeline (opt-in via
-    // config.autoAudit). Streamed before "done" so the client is still listening.
-    // Skipped when a provider limit cut the run short — the work is incomplete
-    // by definition, and the audit would only burn more of the exhausted quota.
-    if (!clientGone && !haltedBy && getConfig().autoAudit) {
-      sse(res, { type: 'status', message: '🔎 Auditor: reviewing the completed work…' });
-      try {
-        const audit = await runAudit(cwd);
-        sse(res, {
-          type: 'audit',
-          result: audit,
-          message: `🔎 Audit verdict: ${String(audit.verdict).toUpperCase()} — ${audit.summary}`,
-        });
-      } catch (e) {
-        sse(res, { type: 'log', log: `[audit] failed: ${e.message}\n` });
-      }
-    }
-
-    if (haltedBy) {
-      sse(res, {
-        type: 'done',
-        message:
-          `⏸️ Run paused — ${haltedBy.reason}. The remaining tasks are still PENDING ` +
-          `(not aborted); press Run again once the limit resets.`,
-      });
-    } else {
-      const nAborted = orderedTasks.filter((t) => abortedSet.has(t.id)).length;
-      const skipNote = skipped.length
-        ? ` ${skipped.length} previously-aborted task(s) were skipped: ${skipped.join(', ')}.`
-        : '';
-      sse(res, {
-        type: 'done',
-        message:
-          (nAborted ? `⚠️ Run finished — ${nAborted} task(s) aborted.` : '✅ All tasks complete.') +
-          skipNote,
-      });
-    }
-    clearRunning();
-    if (!clientGone) res.end();
-    return;
-  }
-
-  // -------------------------------------------------------------------------
-  // CONCURRENT MODE (advanced/legacy): the original DAG scheduler below.
-  // -------------------------------------------------------------------------
   sse(res, {
     type: 'status',
-    message: `Starting run in ${cwd} — ⚡ Concurrent mode (up to ${maxConc} in parallel)`,
+    message: `Starting run in ${cwd} — up to ${maxConc} task(s) in parallel, in dependency order`,
   });
 
-  // First pass: figure out which files each task touches so we can parallelize
-  // only the ones that don't collide.
-  sse(res, { type: 'status', message: '🔎 First pass: analyzing task file isolation (fable)…' });
-  await analyzeFiles(readJson(FILES.tasks, []), cwd);
-  if (clientGone) return;
+  // Parallelism is meaningless at concurrency 1, so only pay for the file-
+  // isolation analysis pass when it can actually matter (Phase 2 gate — see
+  // REDESIGN_PLAN.md: without this, unifying the modes would add a new LLM
+  // call to every former-sequential run).
+  if (maxConc > 1) {
+    sse(res, { type: 'status', message: '🔎 First pass: analyzing task file isolation (fable)…' });
+    await analyzeFiles(readJson(FILES.tasks, []), cwd);
+    if (clientGone) return;
+  }
 
   const filesInUse = new Set(); // files being edited by currently in-flight tasks
   const inFlight = new Map(); // id -> Promise<{ id, task, ok, rateLimited }>
@@ -1710,16 +1637,12 @@ async function handleRun(res) {
   const abortedSet = new Set(readJson(FILES.aborted, []));
   const markAborted = (id) => {
     abortedSet.add(id);
-    const arr = readJson(FILES.aborted, []);
-    if (!arr.includes(id)) {
-      arr.push(id);
-      writeJson(FILES.aborted, arr);
-    }
+    markTaskAborted(id);
   };
 
   // Set when a provider rate/usage limit is hit. Stops NEW launches; tasks
   // already in flight are drained first, then the run ends with everything
-  // untouched still pending (see the sequential-mode note above).
+  // untouched still pending.
   let haltedBy = null;
 
   while (!clientGone) {
@@ -1844,11 +1767,7 @@ async function handleRun(res) {
       continue;
     }
 
-    const comp = readJson(FILES.completed, []);
-    if (!comp.includes(done.id)) {
-      comp.push(done.id);
-      writeJson(FILES.completed, comp);
-    }
+    markTaskCompleted(done.id);
     sse(res, { type: 'task-complete', id: done.id, message: `✅ ${done.id} done.` });
 
     // Feature 4: record what this task changed for downstream tasks to read.
@@ -1856,6 +1775,24 @@ async function handleRun(res) {
     // Feature 6: if this task had failed before (error log present), distill and
     // store the lesson learned, then clear the error log.
     await recordLesson(done.task);
+  }
+
+  // P5: optional Auditor pass at the end of the pipeline (opt-in via
+  // config.autoAudit). Streamed before "done" so the client is still listening.
+  // Skipped when a provider limit cut the run short — the work is incomplete
+  // by definition, and the audit would only burn more of the exhausted quota.
+  if (!clientGone && !haltedBy && getConfig().autoAudit) {
+    sse(res, { type: 'status', message: '🔎 Auditor: reviewing the completed work…' });
+    try {
+      const audit = await runAudit(cwd);
+      sse(res, {
+        type: 'audit',
+        result: audit,
+        message: `🔎 Audit verdict: ${String(audit.verdict).toUpperCase()} — ${audit.summary}`,
+      });
+    } catch (e) {
+      sse(res, { type: 'log', log: `[audit] failed: ${e.message}\n` });
+    }
   }
 
   // Feature 2: run over — nothing should still show as running.
@@ -1879,7 +1816,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'POST' && pathname === '/api/plan') return await handlePlan(req, res);
     if (req.method === 'POST' && pathname === '/api/split') return await handleSplit(req, res);
-    if (req.method === 'POST' && pathname === '/api/mode') return await handleSetMode(req, res);
+    if (req.method === 'POST' && pathname === '/api/concurrency') return await handleSetConcurrency(req, res);
     if (req.method === 'POST' && pathname === '/api/config') return await handleSetConfig(req, res);
     if (req.method === 'GET' && pathname === '/api/tasks') return handleGetTasks(res);
     if (req.method === 'GET' && pathname === '/api/models') return handleGetModels(res);

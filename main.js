@@ -9,7 +9,7 @@ const API_BASE = import.meta.env.VITE_API_URL || '';
 // (capability-filtered so only CLI/tool-capable models appear). EFFORTS is static.
 const EFFORTS = ['low', 'medium', 'high', 'ultracode'];
 
-let state = { tasks: [], completed: [], aborted: [], running: [], mode: 'sequential', models: [], roles: {}, keys: [] };
+let state = { tasks: [], completed: [], aborted: [], running: [], maxConcurrency: 3, models: [], roles: {}, keys: [] };
 let eventSource = null;
 let refreshTimer = null;
 // Per-task SSE streams for individually-started tasks (id -> EventSource).
@@ -21,7 +21,7 @@ const planBtn = el('planBtn');
 const runBtn = el('runBtn');
 const splitBtn = el('splitBtn');
 const lessonsBtn = el('lessonsBtn');
-const modeToggle = el('modeToggle');
+const concurrencyInput = el('concurrencyInput');
 const retryAllBtn = el('retryAllBtn');
 const promptFile = el('promptFile');
 const promptText = el('promptText');
@@ -286,9 +286,9 @@ async function loadTasks() {
     state.completed = data.completed || [];
     state.aborted = data.aborted || [];
     state.running = data.running || [];
-    if (data.mode) state.mode = data.mode;
+    if (data.maxConcurrency) state.maxConcurrency = data.maxConcurrency;
     if (data.targetDir && !targetDir.value) targetDir.value = data.targetDir;
-    renderMode();
+    renderConcurrency();
     renderTable();
   } catch (e) {
     // Non-fatal on first load (no tasks.json yet).
@@ -725,44 +725,35 @@ tableWrap.addEventListener('click', async (e) => {
   }
 });
 
-// --- Run mode (Sequential / Concurrent) ------------------------------------
-function renderMode() {
-  if (!modeToggle) return;
-  modeToggle.querySelectorAll('.mode-btn').forEach((btn) => {
-    btn.classList.toggle('active', btn.dataset.mode === state.mode);
-  });
+// --- Concurrency (max tasks in flight) --------------------------------------
+function renderConcurrency() {
+  if (!concurrencyInput) return;
+  if (document.activeElement !== concurrencyInput) {
+    concurrencyInput.value = state.maxConcurrency;
+  }
 }
 
-modeToggle?.addEventListener('click', async (e) => {
-  const btn = e.target.closest('.mode-btn');
-  if (!btn) return;
-  const mode = btn.dataset.mode;
-  if (mode === state.mode) return;
-  // Don't let the mode change mid-run — it wouldn't take effect until the next
-  // run and would be confusing.
+concurrencyInput?.addEventListener('change', async () => {
+  const n = Math.max(1, Math.floor(Number(concurrencyInput.value)) || 1);
+  // Don't let this change mid-run — it wouldn't take effect until the next run.
   if (eventSource) {
-    log('⚠ Stop the current run before changing the run mode.\n', 'status-err');
+    log('⚠ Stop the current run before changing concurrency.\n', 'status-err');
+    renderConcurrency();
     return;
   }
-  const prev = state.mode;
-  state.mode = mode; // optimistic
-  renderMode();
+  const prev = state.maxConcurrency;
+  state.maxConcurrency = n; // optimistic
   try {
-    await api('/api/mode', {
+    await api('/api/concurrency', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify({ maxConcurrency: n }),
     });
-    log(
-      mode === 'sequential'
-        ? '🧭 Run mode: Sequential — tasks run one at a time, in plan order.\n'
-        : '⚡ Run mode: Concurrent — parallel DAG scheduler (advanced).\n',
-      'status-line'
-    );
+    log(`⚡ Concurrency set to ${n}.\n`, 'status-line');
   } catch (err) {
-    state.mode = prev; // revert on failure
-    renderMode();
-    log(`⚠ failed to set run mode: ${err.message}\n`, 'status-err');
+    state.maxConcurrency = prev; // revert on failure
+    renderConcurrency();
+    log(`⚠ failed to set concurrency: ${err.message}\n`, 'status-err');
   }
 });
 
@@ -1131,7 +1122,7 @@ runBtn.addEventListener('click', async () => {
 });
 
 // --- Boot ------------------------------------------------------------------
-renderMode(); // highlight the default immediately; loadTasks() refines it
+renderConcurrency(); // show the default immediately; loadTasks() refines it
 loadModels().then(loadTasks); // models first so the per-task dropdowns populate
 loadKeys(); // API-key panel (independent of models/tasks)
 loadContext();

@@ -105,15 +105,16 @@
       button.retry { background: #3a1c1c; color: var(--danger); border-color: transparent; }
       button.start { background: #123a1e; color: var(--accent-2); border-color: transparent; }
       button.stop { background: #3a1c1c; color: var(--danger); border-color: transparent; }
-      /* Segmented Sequential/Concurrent run-mode toggle */
-      .mode-toggle { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
-      .mode-toggle .mode-btn {
-        border: none; border-radius: 0; background: var(--panel-2); color: var(--muted);
-        padding: 8px 12px; font-weight: 600;
+      /* Max-tasks-in-flight control (replaces the old Sequential/Concurrent toggle) */
+      .concurrency-control {
+        display: inline-flex; align-items: center; gap: 6px;
+        border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2);
+        color: var(--muted); padding: 8px 12px; font-weight: 600;
       }
-      .mode-toggle .mode-btn + .mode-btn { border-left: 1px solid var(--border); }
-      .mode-toggle .mode-btn.active { background: var(--accent); color: #0b1020; }
-      .mode-toggle .mode-btn:not(.active):hover { color: var(--text); }
+      .concurrency-control input {
+        background: var(--panel); color: var(--text); border: 1px solid var(--border);
+        border-radius: 4px; padding: 2px 4px;
+      }
       /* Modal overlay for the log / lessons views */
       .modal-overlay {
         position: fixed; inset: 0; background: rgba(0,0,0,0.6);
@@ -252,9 +253,9 @@
         <h2>
           2 · Task Breakdown
           <span style="float:right; display:inline-flex; gap:8px; align-items:center;">
-            <span class="mode-toggle" id="modeToggle" title="Sequential runs tasks one-by-one in plan order (recommended). Concurrent runs the parallel DAG scheduler.">
-              <button data-mode="sequential" class="mode-btn">🧭 Sequential</button>
-              <button data-mode="concurrent" class="mode-btn">⚡ Concurrent</button>
+            <span class="concurrency-control" title="Max tasks in flight at once. 1 = one task at a time, in dependency order.">
+              ⚡ Concurrency
+              <input type="number" id="concurrencyInput" min="1" max="10" step="1" style="width:3.5em;" />
             </span>
             <button id="lessonsBtn" title="Lessons learned from previously-failed tasks">📚 Lessons</button>
             <button id="splitBtn" title="Ask the model to split oversized/complex tasks">🔬 Split Tasks</button>
