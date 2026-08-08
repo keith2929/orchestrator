@@ -12,17 +12,11 @@ node_modules/
 # Runtime/state — regenerated at runtime, not source
 logs/
 error_logs/
-memory.json
-memory.*.json
-tasks.json
-completed.json
-aborted.json
 performance.json
-planner_chat.json
-session_context.md
-session_context.*.md
-mode.json
 config.json.bak
 *.bak
 *.bak-*
 .goutputstream-*
+
+# Project state now lives in <targetDir>/.orchestrator/ (see REDESIGN_PLAN.md
+# Phase 1) — nothing project-scoped stays in this repo anymore.

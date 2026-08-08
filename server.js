@@ -50,19 +50,58 @@ process.on('unhandledRejection', (reason) => {
 // now live in clients/ (claude-cli.js) and execution/.
 const IS_WIN = process.platform === 'win32';
 
-const FILES = {
-  master: path.join(__dirname, 'MASTER_PROMPT.md'),
-  tasks: path.join(__dirname, 'tasks.json'),
-  completed: path.join(__dirname, 'completed.json'),
-  aborted: path.join(__dirname, 'aborted.json'),
-  config: path.join(__dirname, 'config.json'),
-  // --- New feature state (all relative to this orchestrator dir) -------------
-  running: path.join(__dirname, 'running.json'), // Feature 2: persistent "Running"
-  sessionContext: path.join(__dirname, 'session_context.md'), // Feature 4: stitching
-  memory: path.join(__dirname, 'memory.json'), // Feature 6: lessons learned
-  mode: path.join(__dirname, 'mode.json'), // Run mode: "sequential" | "concurrent"
-  plannerChat: path.join(__dirname, 'planner_chat.json'), // Durable "chat with the planner" transcript
+// config.json is the one file that MUST live next to this script, not under a
+// target dir — it's what tells us the target dir in the first place. Every
+// other file is project state and lives in <targetDir>/.orchestrator/, so that
+// switching projects never bleeds state between them (see REDESIGN_PLAN.md
+// Phase 1). FILES is a Proxy so existing call sites (`FILES.tasks`, …) keep
+// working unchanged while resolving lazily against the *current* targetDir.
+const CONFIG_FILE = path.join(__dirname, 'config.json');
+
+const STATE_FILENAMES = {
+  master: 'MASTER_PROMPT.md',
+  tasks: 'tasks.json',
+  completed: 'completed.json',
+  aborted: 'aborted.json',
+  running: 'running.json', // Feature 2: persistent "Running"
+  sessionContext: 'session_context.md', // Feature 4: stitching
+  memory: 'memory.json', // Feature 6: lessons learned
+  mode: 'mode.json', // Run mode: "sequential" | "concurrent"
+  plannerChat: 'planner_chat.json', // Durable "chat with the planner" transcript
 };
+
+// <targetDir>/.orchestrator/ — created on first access. Reads config.json
+// directly (not via getConfig(), which is defined below and would recurse
+// back through FILES.config) to avoid a definition-order cycle.
+function getStateDir() {
+  const cfg = readJsonFile(CONFIG_FILE, {});
+  const targetDir = cfg.targetDir || process.cwd();
+  const dir = path.join(targetDir, '.orchestrator');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    /* best-effort: creation errors surface later on read/write */
+  }
+  return dir;
+}
+function readJsonFile(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return fallback;
+  }
+}
+
+const FILES = new Proxy(
+  { config: CONFIG_FILE },
+  {
+    get(target, prop) {
+      if (prop in target) return target[prop];
+      if (prop in STATE_FILENAMES) return path.join(getStateDir(), STATE_FILENAMES[prop]);
+      return undefined;
+    },
+  }
+);
 
 // Run modes. Sequential (the default) runs tasks strictly in plan order, one at
 // a time — the reliable choice, since it never violates a hidden ordering
@@ -322,9 +361,12 @@ async function handlePlan(req, res) {
   const targetDir = (body.targetDir || '').trim() || process.cwd();
   if (!prompt) return sendJson(res, 400, { error: 'Missing "prompt" in request body.' });
 
-  fs.writeFileSync(FILES.master, prompt);
-  // Merge targetDir into config — must NOT clobber "clients"/"roles".
+  // Merge targetDir into config BEFORE any FILES.* write below — FILES now
+  // resolves against the *current* config.targetDir, so writing master first
+  // would target the previous project's state dir.
   writeJson(FILES.config, { ...readJson(FILES.config, {}), targetDir });
+  ensureStateDirIgnored(targetDir);
+  fs.writeFileSync(FILES.master, prompt);
 
   // Offer the planner the concrete, worker-eligible "client:model" refs it may
   // assign, so it never emits a model that can't actually run a task.
@@ -509,6 +551,7 @@ async function handleSetConfig(req, res) {
   }
   // Merge — preserve "clients"/"roles" already in config.json.
   writeJson(FILES.config, { ...readJson(FILES.config, {}), targetDir });
+  ensureStateDirIgnored(targetDir);
   sendJson(res, 200, { targetDir });
 }
 
@@ -1106,11 +1149,31 @@ function gitChangedFiles(cwd) {
         const files = String(stdout)
           .split('\n')
           .map((l) => l.slice(3).trim()) // strip the 2-char status + space
-          .filter(Boolean);
+          .filter(Boolean)
+          // Defense in depth: .orchestrator/ should already be gitignored in the
+          // target repo (see ensureStateDirIgnored), but a stale/missing
+          // .gitignore must never let our own state churn masquerade as a
+          // task's changed files.
+          .filter((f) => f !== '.orchestrator' && !f.startsWith('.orchestrator/'));
         resolve(files);
       }
     );
   });
+}
+
+// Adds ".orchestrator/" to the target repo's .gitignore, once, the first time
+// a targetDir is set. Idempotent: no-ops if already present. Best-effort —
+// a non-git target dir or a permissions error must not block anything else.
+function ensureStateDirIgnored(targetDir) {
+  try {
+    const giPath = path.join(targetDir, '.gitignore');
+    const existing = fs.existsSync(giPath) ? fs.readFileSync(giPath, 'utf8') : '';
+    if (/(^|\n)\.orchestrator\/?(\n|$)/.test(existing)) return;
+    const sep = existing && !existing.endsWith('\n') ? '\n' : '';
+    fs.writeFileSync(giPath, `${existing}${sep}.orchestrator/\n`);
+  } catch {
+    /* best-effort */
+  }
 }
 
 // Feature 4: append a completion note (task id + changed files) to
