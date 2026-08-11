@@ -26,7 +26,7 @@ import { setEnvKey } from './env.js';
 import { resolveRole } from './roles.js';
 import { runRole } from './roles/index.js';
 import { listModels } from './clients/index.js';
-import { getRolesConfig, getClientsConfig, CONTEXT_DIR, detectRateLimit } from './shared.js';
+import { getRolesConfig, getClientsConfig, CONTEXT_DIR, detectRateLimit, parseRetryAfterMs } from './shared.js';
 import { execute } from './execution/index.js';
 import { checkClaudeAuth } from './execution/native.js';
 
@@ -68,6 +68,7 @@ const STATE_FILENAMES = {
   sessionContext: 'session_context.md', // Feature 4: stitching
   memory: 'memory.json', // Feature 6: lessons learned
   plannerChat: 'planner_chat.json', // Durable "chat with the planner" transcript
+  pause: 'pause.json', // Phase 4: { reason, resumeAt } while auto-paused on a provider limit
 };
 
 // <targetDir>/.orchestrator/ — created on first access. Reads config.json
@@ -865,7 +866,7 @@ async function handleRunOne(res, id) {
     message: `▶️ ${task.id} — ${task.description} [${task.assigned_model}/${task.effort}]`,
   });
 
-  const { ok, rateLimited } = await runTask(task, cwd, res);
+  const { ok, rateLimited } = await runTask(task, cwd, (payload) => sse(res, payload));
   if (clientGone) return;
 
   // A provider limit isn't this task's fault — leave it PENDING rather than
@@ -1165,7 +1166,7 @@ async function analyzeFiles(tasks, cwd) {
   return tasks;
 }
 
-function runTask(task, cwd, res) {
+function runTask(task, cwd, emit) {
   return new Promise((resolve) => {
     const contextFiles = listContextFiles();
     const contextBlock = contextFiles.length
@@ -1270,15 +1271,15 @@ function runTask(task, cwd, res) {
       let buf = (isErr ? errBuf : outBuf) + raw;
       let nl;
       while ((nl = buf.indexOf('\n')) !== -1) {
-        sse(res, { type: 'log', log: `[${task.id}] ${buf.slice(0, nl)}\n` });
+        emit({ type: 'log', log: `[${task.id}] ${buf.slice(0, nl)}\n` });
         buf = buf.slice(nl + 1);
       }
       if (isErr) errBuf = buf;
       else outBuf = buf;
     };
     const flush = () => {
-      if (outBuf) sse(res, { type: 'log', log: `[${task.id}] ${outBuf}\n` });
-      if (errBuf) sse(res, { type: 'log', log: `[${task.id}] ${errBuf}\n` });
+      if (outBuf) emit({ type: 'log', log: `[${task.id}] ${outBuf}\n` });
+      if (errBuf) emit({ type: 'log', log: `[${task.id}] ${errBuf}\n` });
       outBuf = errBuf = '';
     };
 
@@ -1359,6 +1360,112 @@ function runTask(task, cwd, res) {
 // silently diverged from the graph the moment a UI edit, a re-split, or the
 // planner emitted tasks out of topological order (see REDESIGN_PLAN.md).
 // ---------------------------------------------------------------------------
+// Run manager (Phase 4): the run loop is a server-owned process, not tied to
+// one HTTP request. GET /api/run subscribes the response to live broadcast()
+// output and starts runLoop() if one isn't already active; closing the tab or
+// losing the connection only drops that subscription — the loop keeps going.
+// A genuine stop is now an explicit action (POST /api/run/stop), since
+// connection loss no longer implies "stop".
+// ---------------------------------------------------------------------------
+const DEFAULT_PAUSE_BACKOFF_MS = 5 * 60 * 1000; // used when the provider gave no reset hint
+const MAX_PAUSE_BACKOFF_MS = 30 * 60 * 1000;
+
+const runManager = {
+  active: false,
+  subscribers: new Set(), // Set<res>
+  stopRequested: false,
+  resumeTimer: null,
+};
+
+function broadcast(payload) {
+  for (const res of runManager.subscribers) sse(res, payload);
+}
+function subscribeRun(res) {
+  runManager.subscribers.add(res);
+  res.on('close', () => runManager.subscribers.delete(res));
+}
+
+function clearPause() {
+  if (runManager.resumeTimer) {
+    clearTimeout(runManager.resumeTimer);
+    runManager.resumeTimer = null;
+  }
+  try {
+    fs.unlinkSync(FILES.pause);
+  } catch {
+    /* already gone */
+  }
+}
+
+// Persists { reason, resumeAt } and schedules an unattended re-invocation of
+// runLoop — "press Run again once the limit resets" becomes automatic. Honors
+// a provider-stated wait (parseRetryAfterMs) when present, else a conservative
+// fixed backoff that grows on repeated pauses (capped) so a persistent outage
+// doesn't hammer the provider every 5 minutes forever.
+function schedulePauseResume(reason) {
+  const prior = readJson(FILES.pause, null);
+  const streak = prior && prior.reason === reason ? (prior.streak || 1) + 1 : 1;
+  const waitMs = Math.min(
+    parseRetryAfterMs(reason) || DEFAULT_PAUSE_BACKOFF_MS * streak,
+    MAX_PAUSE_BACKOFF_MS
+  );
+  const resumeAt = Date.now() + waitMs;
+  writeJson(FILES.pause, { reason, resumeAt, streak });
+  if (runManager.resumeTimer) clearTimeout(runManager.resumeTimer);
+  runManager.resumeTimer = setTimeout(() => {
+    runManager.resumeTimer = null;
+    try {
+      fs.unlinkSync(FILES.pause);
+    } catch {
+      /* already gone */
+    }
+    broadcast({ type: 'status', message: '▶️ Auto-resuming after provider limit…' });
+    startRunLoop();
+  }, waitMs);
+  return resumeAt;
+}
+
+// Called once at boot: a pause.json left over from a backend restart mid-pause
+// must still resume unattended, not silently wait forever for a click.
+function resumeStalePauseOnBoot() {
+  const pause = readJson(FILES.pause, null);
+  if (!pause || !pause.resumeAt) return;
+  const remaining = pause.resumeAt - Date.now();
+  if (remaining <= 0) {
+    try {
+      fs.unlinkSync(FILES.pause);
+    } catch {
+      /* ignore */
+    }
+    startRunLoop();
+  } else {
+    runManager.resumeTimer = setTimeout(() => {
+      runManager.resumeTimer = null;
+      try {
+        fs.unlinkSync(FILES.pause);
+      } catch {
+        /* ignore */
+      }
+      startRunLoop();
+    }, remaining);
+  }
+}
+
+// Starts runLoop() if one isn't already active. Fire-and-forget — callers
+// (handleRun, the auto-resume timer) do not await this.
+function startRunLoop() {
+  if (runManager.active) return;
+  runManager.active = true;
+  runManager.stopRequested = false;
+  runLoop()
+    .catch((e) => {
+      broadcast({ type: 'error', message: `⛔ Run crashed: ${e.message}` });
+    })
+    .finally(() => {
+      runManager.active = false;
+    });
+}
+
 async function handleRun(res) {
   setCors(res);
   res.writeHead(200, {
@@ -1366,7 +1473,47 @@ async function handleRun(res) {
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
   });
+  subscribeRun(res);
 
+  if (runManager.active) {
+    sse(res, { type: 'status', message: '📡 Reattached to an in-progress run.' });
+    return;
+  }
+  const pause = readJson(FILES.pause, null);
+  if (pause) {
+    sse(res, {
+      type: 'paused',
+      message: `⏸️ Paused — ${pause.reason}. Auto-resuming at ${new Date(pause.resumeAt).toLocaleTimeString()}.`,
+    });
+    return;
+  }
+  startRunLoop();
+}
+
+// POST /api/run/stop — the explicit stop that used to be implied by closing
+// the SSE connection (Phase 2 and earlier). Cancels any pending auto-resume
+// too, since a user-requested stop should not silently restart itself.
+function handleStopRun(res) {
+  runManager.stopRequested = true;
+  clearPause();
+  broadcast({ type: 'status', message: '⏹️ Stop requested — finishing in-flight task(s), then stopping.' });
+  sendJson(res, 200, { stopping: true });
+}
+
+// ---------------------------------------------------------------------------
+// The run loop. Unified in Phase 2: there is one scheduler, built on what was
+// previously "concurrent mode"'s depsMet logic — it always follows the real
+// depends_on graph (re-read fresh each iteration), never array position.
+// maxConcurrency=1 reproduces the old "sequential" guarantee (one task at a
+// time, real dependency order) without a second code path; the old sequential
+// mode's bug was that it used array position INSTEAD of depends_on, which
+// silently diverged from the graph the moment a UI edit, a re-split, or the
+// planner emitted tasks out of topological order (see REDESIGN_PLAN.md).
+//
+// Phase 4: detached from any single HTTP request — see runManager above.
+// stopRequested (not clientGone) is now the only thing that halts the loop.
+// ---------------------------------------------------------------------------
+async function runLoop() {
   const cfg = getConfig();
   const cwd = cfg.targetDir || process.cwd();
   // Max tasks in flight at once. Tasks only actually run in parallel when
@@ -1377,10 +1524,7 @@ async function handleRun(res) {
     Number(process.env.CONCURRENCY) || Number(cfg.maxConcurrency) || DEFAULT_MAX_CONCURRENCY
   );
 
-  let clientGone = false;
-  res.on('close', () => {
-    clientGone = true;
-  });
+  const stopped = () => runManager.stopRequested;
 
   // Feature 2: clear any stale "running" entries left by a previously crashed or
   // force-closed run before we start fresh.
@@ -1388,17 +1532,29 @@ async function handleRun(res) {
 
   // Preflight: catch "claude CLI not logged in / not installed" ONCE, up front,
   // instead of aborting every queued task with the same stderr one by one.
-  sse(res, { type: 'status', message: '🔐 Checking claude CLI login…' });
+  broadcast({ type: 'status', message: '🔐 Checking claude CLI login…' });
   const auth = await checkClaudeAuth();
   if (!auth.ok) {
-    sse(res, { type: 'error', message: `⛔ ${auth.message}` });
-    sse(res, { type: 'done', message: `⛔ Run stopped before starting — ${auth.message}` });
+    // A rate limit can trip on this ping itself, before any task ever runs —
+    // that must auto-resume too, not just stop cold (the whole point of
+    // Phase 4 is no click required).
+    if (auth.rateLimited) {
+      const resumeAt = schedulePauseResume(auth.message);
+      broadcast({
+        type: 'paused',
+        message: `⏸️ ${auth.message} — auto-resuming at ${new Date(resumeAt).toLocaleTimeString()}.`,
+      });
+      broadcast({ type: 'done', message: `⏸️ Run paused before starting — ${auth.message}` });
+      clearRunning();
+      return;
+    }
+    broadcast({ type: 'error', message: `⛔ ${auth.message}` });
+    broadcast({ type: 'done', message: `⛔ Run stopped before starting — ${auth.message}` });
     clearRunning();
-    if (!clientGone) res.end();
     return;
   }
 
-  sse(res, {
+  broadcast({
     type: 'status',
     message: `Starting run in ${cwd} — up to ${maxConc} task(s) in parallel, in dependency order`,
   });
@@ -1408,9 +1564,9 @@ async function handleRun(res) {
   // REDESIGN_PLAN.md: without this, unifying the modes would add a new LLM
   // call to every former-sequential run).
   if (maxConc > 1) {
-    sse(res, { type: 'status', message: '🔎 First pass: analyzing task file isolation (fable)…' });
+    broadcast({ type: 'status', message: '🔎 First pass: analyzing task file isolation (fable)…' });
     await analyzeFiles(readJson(FILES.tasks, []), cwd);
-    if (clientGone) return;
+    if (stopped()) return;
   }
 
   const filesInUse = new Set(); // files being edited by currently in-flight tasks
@@ -1433,7 +1589,7 @@ async function handleRun(res) {
   // untouched still pending.
   let haltedBy = null;
 
-  while (!clientGone) {
+  while (!stopped()) {
     const allTasks = readJson(FILES.tasks, []);
     const completed = new Set(readJson(FILES.completed, []));
     const isDone = (id) => completed.has(id);
@@ -1445,7 +1601,7 @@ async function handleRun(res) {
       if (isDone(t.id) || isAborted(t.id) || inFlight.has(t.id)) continue;
       if ((t.depends_on || []).some((d) => isAborted(d))) {
         markAborted(t.id);
-        sse(res, {
+        broadcast({
           type: 'task-aborted',
           id: t.id,
           message: `⛔ ${t.id} aborted — a dependency could not be completed.`,
@@ -1458,7 +1614,7 @@ async function handleRun(res) {
     );
     if (pending.length === 0 && inFlight.size === 0) {
       const nAborted = allTasks.filter((t) => isAborted(t.id)).length;
-      sse(res, {
+      broadcast({
         type: 'done',
         message: nAborted
           ? `⚠️ Run finished — ${nAborted} task(s) aborted.`
@@ -1467,13 +1623,15 @@ async function handleRun(res) {
       break;
     }
 
-    // Halted by a provider limit and everything in flight has drained.
+    // Halted by a provider limit and everything in flight has drained: pause
+    // and schedule an unattended auto-resume instead of just stopping.
     if (haltedBy && inFlight.size === 0) {
-      sse(res, {
+      const resumeAt = schedulePauseResume(haltedBy.reason);
+      broadcast({
         type: 'done',
         message:
           `⏸️ Run paused — ${haltedBy.reason}. The remaining tasks are still PENDING ` +
-          `(not aborted); press Run again once the limit resets.`,
+          `(not aborted); auto-resuming at ${new Date(resumeAt).toLocaleTimeString()}.`,
       });
       break;
     }
@@ -1495,26 +1653,26 @@ async function handleRun(res) {
       }
 
       claim(t);
-      sse(res, {
+      broadcast({
         type: 'task-start',
         id: t.id,
         message: `▶️ ${t.id} — ${t.description} [${t.assigned_model}/${t.effort}]`,
       });
       inFlight.set(
         t.id,
-        runTask(t, cwd, res).then((r) => ({ id: t.id, task: t, ...r }))
+        runTask(t, cwd, broadcast).then((r) => ({ id: t.id, task: t, ...r }))
       );
       launched = true;
 
       if (unknownFiles) break; // solo task: don't start anything alongside it
       await delay(1500); // gentle stagger between parallel launches
-      if (clientGone) break;
+      if (stopped()) break;
     }
 
     if (inFlight.size === 0) {
       // Nothing running and nothing could be launched => genuinely stuck.
       if (!launched) {
-        sse(res, {
+        broadcast({
           type: 'error',
           message:
             '⛔ Stuck: pending tasks remain but their dependencies are unmet or circular. ' +
@@ -1529,13 +1687,13 @@ async function handleRun(res) {
     const done = await Promise.race(inFlight.values());
     inFlight.delete(done.id);
     release(done.task);
-    if (clientGone) break;
+    if (stopped()) break;
 
     // A provider limit is not this task's fault and will hit every other task
     // identically, so leave it PENDING and stop launching new work.
     if (done.rateLimited) {
       haltedBy = done.rateLimited;
-      sse(res, {
+      broadcast({
         type: 'paused',
         message: `⏸️ ${done.id} did not run — ${done.rateLimited.reason}`,
       });
@@ -1547,7 +1705,7 @@ async function handleRun(res) {
       // carry on with tasks that don't depend on it (dependents cascade to
       // aborted at the top of the next loop).
       markAborted(done.id);
-      sse(res, {
+      broadcast({
         type: 'task-aborted',
         id: done.id,
         message: `❌ ${done.id} could not be completed — marked aborted. Continuing with remaining tasks.`,
@@ -1556,7 +1714,7 @@ async function handleRun(res) {
     }
 
     markTaskCompleted(done.id);
-    sse(res, { type: 'task-complete', id: done.id, message: `✅ ${done.id} done.` });
+    broadcast({ type: 'task-complete', id: done.id, message: `✅ ${done.id} done.` });
 
     // Feature 4: record what this task changed for downstream tasks to read.
     await appendSessionContext(done.id, cwd);
@@ -1566,26 +1724,25 @@ async function handleRun(res) {
   }
 
   // P5: optional Auditor pass at the end of the pipeline (opt-in via
-  // config.autoAudit). Streamed before "done" so the client is still listening.
-  // Skipped when a provider limit cut the run short — the work is incomplete
-  // by definition, and the audit would only burn more of the exhausted quota.
-  if (!clientGone && !haltedBy && getConfig().autoAudit) {
-    sse(res, { type: 'status', message: '🔎 Auditor: reviewing the completed work…' });
+  // config.autoAudit). Skipped when a provider limit cut the run short — the
+  // work is incomplete by definition, and the audit would only burn more of
+  // the exhausted quota. Also skipped on an explicit stop, for the same reason.
+  if (!stopped() && !haltedBy && getConfig().autoAudit) {
+    broadcast({ type: 'status', message: '🔎 Auditor: reviewing the completed work…' });
     try {
       const audit = await runAudit(cwd);
-      sse(res, {
+      broadcast({
         type: 'audit',
         result: audit,
         message: `🔎 Audit verdict: ${String(audit.verdict).toUpperCase()} — ${audit.summary}`,
       });
     } catch (e) {
-      sse(res, { type: 'log', log: `[audit] failed: ${e.message}\n` });
+      broadcast({ type: 'log', log: `[audit] failed: ${e.message}\n` });
     }
   }
 
   // Feature 2: run over — nothing should still show as running.
   clearRunning();
-  if (!clientGone) res.end();
 }
 
 // ---------------------------------------------------------------------------
@@ -1644,6 +1801,7 @@ const server = http.createServer(async (req, res) => {
       return handleDeleteContext(res, name);
     }
     if (req.method === 'GET' && pathname === '/api/run') return await handleRun(res);
+    if (req.method === 'POST' && pathname === '/api/run/stop') return handleStopRun(res);
     if (req.method === 'GET' && pathname === '/api/health') {
       return sendJson(res, 200, { ok: true });
     }
@@ -1666,4 +1824,8 @@ server.listen(PORT, () => {
   }
   console.log(`claude-orchestrator backend listening on http://localhost:${PORT}`);
   console.log(`Using claude binary: ${CLAUDE_BIN}`);
+
+  // Phase 4: a pause.json surviving a backend restart must still auto-resume
+  // — otherwise a crash/redeploy during a provider-limit pause waits forever.
+  resumeStalePauseOnBoot();
 });

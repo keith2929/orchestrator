@@ -291,6 +291,11 @@ async function loadTasks() {
     if (data.targetDir && !targetDir.value) targetDir.value = data.targetDir;
     renderConcurrency();
     renderTable();
+    // Phase 4: the run loop is server-owned, so a page load/reload while one
+    // is in flight (or auto-resuming from a pause) should pick the live
+    // console back up instead of looking idle — same signal the "Running"
+    // badges already use.
+    if (state.running.length && !eventSource) attachRun();
   } catch (e) {
     // Non-fatal on first load (no tasks.json yet).
     console.warn('loadTasks:', e.message);
@@ -1015,8 +1020,13 @@ planBtn.addEventListener('click', async () => {
   }
 });
 
-// --- Run all pending -------------------------------------------------------
-function stopRun() {
+// --- Run all pending ---------------------------------------------------
+// Phase 4: the run loop is server-owned and detached from any one HTTP
+// request — closing this EventSource no longer stops it. `detachRun()` just
+// drops our local subscription/UI state; `stopRun()` additionally tells the
+// backend to actually stop the loop (POST /api/run/stop), and is only what
+// the Stop button does.
+function detachRun() {
   if (eventSource) {
     eventSource.close();
     eventSource = null;
@@ -1029,30 +1039,23 @@ function stopRun() {
   runBtn.textContent = '▶️ Run All Pending';
 }
 
-runBtn.addEventListener('click', async () => {
-  if (eventSource) {
-    stopRun();
-    return;
+async function stopRun() {
+  try {
+    await api('/api/run/stop', { method: 'POST' });
+  } catch (err) {
+    log(`⚠ failed to stop run: ${err.message}\n`, 'status-err');
   }
-  if (!state.tasks.length) {
-    log('No tasks to run. Generate a plan first.\n', 'status-err');
-    return;
-  }
-  // Persist the current directory field first so the run uses it (not a stale
-  // value saved at plan time). Abort if the directory is invalid.
-  if (targetDir.value.trim()) {
-    const ok = await saveDir(true);
-    if (!ok) {
-      log(`\nRun aborted: ${dirStatus.textContent}\n`, 'status-err');
-      return;
-    }
-  }
+  detachRun();
+}
+
+// Subscribes to the (possibly already-running) backend loop. Used both by the
+// Run button and by boot-time auto-reattach, so a page reload mid-run picks
+// the live console back up instead of looking idle while work continues.
+function attachRun() {
+  if (eventSource) return;
   runBtn.textContent = '⏹️ Stop';
-  log('\n=== Run started ===\n', 'status-line');
 
   eventSource = new EventSource(API_BASE + '/api/run');
-
-  // Refresh the table periodically so statuses turn green as tasks complete.
   refreshTimer = setInterval(loadTasks, 3000);
 
   eventSource.onmessage = (ev) => {
@@ -1079,7 +1082,7 @@ runBtn.addEventListener('click', async () => {
         break;
       case 'paused':
         // A provider rate/usage limit. Deliberately NOT the 'error' case: that
-        // one calls stopRun(), which would close the stream before the server's
+        // one detaches, which would close the stream before the server's
         // closing 'done' explanation arrived.
         log('\n' + (msg.message || 'Paused') + '\n', 'status-err');
         loadTasks();
@@ -1099,12 +1102,15 @@ runBtn.addEventListener('click', async () => {
       case 'error':
         log('\n' + (msg.message || 'Error') + '\n', 'status-err');
         loadTasks();
-        stopRun();
+        detachRun();
         break;
       case 'done':
+        // The run loop finished OR auto-paused (message says which) — either
+        // way the backend is done with this subscriber for now. A pause
+        // resumes itself server-side; we just stop watching.
         log('\n' + (msg.message || 'Done') + '\n', 'status-line');
         loadTasks();
-        stopRun();
+        detachRun();
         break;
       default:
         if (msg.log) log(msg.log);
@@ -1113,13 +1119,36 @@ runBtn.addEventListener('click', async () => {
 
   eventSource.onerror = () => {
     // EventSource fires onerror on normal server close too; only report if we
-    // still think we're running.
+    // still think we're running. The backend loop is unaffected either way.
     if (eventSource) {
       log('\n[stream closed]\n', 'status-line');
       loadTasks();
-      stopRun();
+      detachRun();
     }
   };
+}
+
+runBtn.addEventListener('click', async () => {
+  if (eventSource) {
+    log('\n=== Stop requested ===\n', 'status-line');
+    await stopRun();
+    return;
+  }
+  if (!state.tasks.length) {
+    log('No tasks to run. Generate a plan first.\n', 'status-err');
+    return;
+  }
+  // Persist the current directory field first so the run uses it (not a stale
+  // value saved at plan time). Abort if the directory is invalid.
+  if (targetDir.value.trim()) {
+    const ok = await saveDir(true);
+    if (!ok) {
+      log(`\nRun aborted: ${dirStatus.textContent}\n`, 'status-err');
+      return;
+    }
+  }
+  log('\n=== Run started ===\n', 'status-line');
+  attachRun();
 });
 
 // --- Boot ------------------------------------------------------------------
