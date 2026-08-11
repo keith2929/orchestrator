@@ -31,6 +31,8 @@ import { execute } from './execution/index.js';
 import { checkClaudeAuth } from './execution/native.js';
 import { createToolRunner } from './agent/toolRunner.js';
 import { toolList } from './agent/tools/index.js';
+import { getRecipe } from './graph/recipes/index.js';
+import { detectProjectProfile } from './graph/projectProfile.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
@@ -217,8 +219,77 @@ function topoSortTasks(tasks) {
   for (const t of tasks) visit(t);
   return ordered;
 }
+// ---------------------------------------------------------------------------
+// Phase 7: recipe expansion. A type:"recipe" node ({ id, type, depends_on,
+// recipe, params }) is a REFERENCE, never executed directly — it is replaced
+// here by the concrete type:"tool" node chain its expand(params, profile)
+// produces, wired depends_on -> depends_on -> ... so the recipe's internal
+// order is preserved and the first step inherits the recipe node's own
+// dependencies. Runs on every writeTasks() call, so it doesn't matter
+// whether a recipe node arrived via the API or a hand-edited tasks.json.
+// ---------------------------------------------------------------------------
+function expandRecipeNodes(tasks, cwd) {
+  if (!tasks.some((t) => t.type === 'recipe')) return tasks;
+  const profile = detectProjectProfile(cwd);
+  const out = [];
+  for (const t of tasks) {
+    if (t.type !== 'recipe') {
+      out.push(t);
+      continue;
+    }
+    const recipe = getRecipe(t.recipe);
+    if (!recipe) {
+      throw new Error(`Node "${t.id}" references unknown recipe "${t.recipe}".`);
+    }
+    let steps;
+    try {
+      steps = recipe.expand(t.params || {}, profile);
+    } catch (e) {
+      throw new Error(`Recipe "${t.recipe}" failed to expand for node "${t.id}": ${e.message}`);
+    }
+    if (!Array.isArray(steps) || steps.length === 0) {
+      throw new Error(`Recipe "${t.recipe}" produced no steps for node "${t.id}" — nothing to run.`);
+    }
+    let prevIds = Array.isArray(t.depends_on) ? t.depends_on : [];
+    steps.forEach((step, i) => {
+      const stepId = `${t.id}.${i + 1}`;
+      const node = {
+        id: stepId,
+        type: 'tool',
+        description: step.description || `${recipe.id} step ${i + 1}: ${step.tool}(${JSON.stringify(step.args || {})})`,
+        depends_on: prevIds,
+        tool: step.tool,
+        args: step.args || {},
+      };
+      // exclusive/onFailureHint are the recipe's own properties (a barrier
+      // and diagnostic text respectively); onFailure is the graph author's
+      // choice per invocation, not baked into the recipe module.
+      if (recipe.exclusive) node.exclusive = true;
+      if (recipe.onFailureHint) node.onFailureHint = recipe.onFailureHint;
+      if (t.onFailure) node.onFailure = t.onFailure;
+      out.push(node);
+      prevIds = [stepId];
+    });
+  }
+  return out;
+}
+
+// Auto-inserted fix-task ids need a uniqueness suffix — plain `${baseId}.fix`
+// collides if the same node fails twice across retries.
+function uniqueFixId(baseId, existingIds) {
+  let candidate = `${baseId}.fix`;
+  let n = 2;
+  while (existingIds.has(candidate)) {
+    candidate = `${baseId}.fix${n}`;
+    n++;
+  }
+  return candidate;
+}
+
 function writeTasks(tasks) {
-  const ordered = topoSortTasks(tasks);
+  const cwd = getConfig().targetDir || process.cwd();
+  const expanded = expandRecipeNodes(tasks, cwd);
+  const ordered = topoSortTasks(expanded);
   writeJson(FILES.tasks, ordered);
   return ordered;
 }
@@ -768,7 +839,7 @@ async function handlePutTask(req, res, id) {
   const idx = tasks.findIndex((t) => t.id === id);
   if (idx === -1) return sendJson(res, 404, { error: `No task with id "${id}".` });
 
-  const allowed = ['description', 'assigned_model', 'effort', 'depends_on', 'type', 'tool', 'args', 'onFailure'];
+  const allowed = ['description', 'assigned_model', 'effort', 'depends_on', 'type', 'tool', 'args', 'onFailure', 'recipe', 'params'];
   for (const key of allowed) {
     if (key in patch) tasks[idx][key] = patch[key];
   }
@@ -853,7 +924,17 @@ async function handleRunOne(res, id) {
     clientGone = true;
   });
 
-  const tasks = readJson(FILES.tasks, []);
+  // Phase 7: catch an unexpanded recipe node here too (see runLoop) — a
+  // hand-edited tasks.json might get a manual "Start" click before ever
+  // going through a full run.
+  let tasks;
+  try {
+    tasks = writeTasks(readJson(FILES.tasks, []));
+  } catch (e) {
+    sse(res, { type: 'error', message: `⛔ Invalid task graph: ${e.message}` });
+    sse(res, { type: 'done', message: 'done' });
+    return res.end();
+  }
   const task = tasks.find((t) => t.id === id);
   if (!task) {
     sse(res, { type: 'error', message: `No task with id "${id}".` });
@@ -1473,6 +1554,51 @@ function runToolNode(node, cwd, emit) {
   });
 }
 
+// Phase 7: onFailure:"spawn-task". A tool node's failure normally just
+// aborts it (see the scheduler below) — this additionally seeds a NEW,
+// independent task with the recipe's onFailureHint plus the captured error,
+// so the next run has something actionable instead of a dead end the user
+// has to diagnose from scratch. Inserted via writeTasks, so it's
+// topologically valid the moment it lands.
+function spawnFixTask(node, cwd) {
+  const tasks = readJson(FILES.tasks, []);
+  const existingIds = new Set(tasks.map((t) => t.id));
+  const id = uniqueFixId(node.id, existingIds);
+
+  let errorText = '';
+  try {
+    errorText = fs.readFileSync(path.join(ERROR_LOGS_DIR, `${node.id}.txt`), 'utf8');
+  } catch {
+    /* nothing captured */
+  }
+
+  const description = [
+    node.onFailureHint || `The step "${node.id}" (${node.description}) failed. Diagnose and fix it.`,
+    '',
+    `Failed step: ${node.id} — ${node.description}`,
+    errorText ? `\n=== ERROR LOG ===\n${errorText.slice(0, 4000)}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const fix = {
+    id,
+    description,
+    assigned_model: workerModelMenu().fallback,
+    effort: 'medium',
+    depends_on: [],
+  };
+  tasks.push(fix);
+  try {
+    writeTasks(tasks);
+  } catch (e) {
+    // Best-effort: a malformed insertion must not crash the run.
+    console.error(`[spawn-task] failed to insert fix task for ${node.id}: ${e.message}`);
+    return null;
+  }
+  return id;
+}
+
 // ---------------------------------------------------------------------------
 // The run loop. Unified in Phase 2: there is one scheduler, built on what was
 // previously "concurrent mode"'s depsMet logic — it always follows the real
@@ -1649,6 +1775,18 @@ async function runLoop() {
 
   const stopped = () => runManager.stopRequested;
 
+  // Phase 7: a recipe node normally gets expanded the moment it's written
+  // (writeTasks), but tasks.json can also be hand-edited directly — catch an
+  // unexpanded recipe node here too, defensively, before the loop ever tries
+  // to run something it doesn't know how to execute.
+  try {
+    writeTasks(readJson(FILES.tasks, []));
+  } catch (e) {
+    broadcast({ type: 'error', message: `⛔ Invalid task graph: ${e.message}` });
+    broadcast({ type: 'done', message: `⛔ Run stopped before starting — ${e.message}` });
+    return;
+  }
+
   // Feature 2: clear any stale "running" entries left by a previously crashed or
   // force-closed run before we start fresh.
   clearRunning();
@@ -1761,15 +1899,20 @@ async function runLoop() {
 
     // A task can start when its deps are done AND it doesn't clash on files.
     // A task with unknown/empty file info (analysis failed) is treated as
-    // conflicting-with-everything: it runs solo, preserving the old safe order.
+    // conflicting-with-everything: it runs solo, preserving the old safe
+    // order. Phase 7: an exclusive node (a recipe like repo-green-up that
+    // touches the whole workspace) gets the exact same solo treatment —
+    // drain in-flight work first, launch nothing else alongside it — since
+    // static path-conflict detection only knows the paths in a node's own
+    // args and can't see a workspace-wide command coming.
     const depsMet = (t) => (t.depends_on || []).every((d) => isDone(d));
     const startable = pending.filter(depsMet);
 
     let launched = false;
     for (const t of haltedBy ? [] : startable) {
       if (inFlight.size >= maxConc) break;
-      const unknownFiles = !Array.isArray(t.files) || t.files.length === 0;
-      if (unknownFiles) {
+      const soloRequired = t.exclusive || !Array.isArray(t.files) || t.files.length === 0;
+      if (soloRequired) {
         if (inFlight.size > 0) continue; // must run alone
       } else if (overlaps(t)) {
         continue; // shares a file with something in flight
@@ -1781,7 +1924,7 @@ async function runLoop() {
         id: t.id,
         message:
           t.type === 'tool'
-            ? `🔧 ${t.id} — ${t.description} [tool:${t.tool}]`
+            ? `🔧 ${t.id} — ${t.description} [tool:${t.tool}]${t.exclusive ? ' [exclusive]' : ''}`
             : `▶️ ${t.id} — ${t.description} [${t.assigned_model}/${t.effort}]`,
       });
       inFlight.set(
@@ -1790,7 +1933,7 @@ async function runLoop() {
       );
       launched = true;
 
-      if (unknownFiles) break; // solo task: don't start anything alongside it
+      if (soloRequired) break; // solo/exclusive: don't start anything alongside it
       await delay(1500); // gentle stagger between parallel launches
       if (stopped()) break;
     }
@@ -1836,6 +1979,15 @@ async function runLoop() {
         id: done.id,
         message: `❌ ${done.id} could not be completed — marked aborted. Continuing with remaining tasks.`,
       });
+      if (done.task.type === 'tool' && done.task.onFailure === 'spawn-task') {
+        const fixId = spawnFixTask(done.task, cwd);
+        if (fixId) {
+          broadcast({
+            type: 'status',
+            message: `🩹 Spawned fix task "${fixId}" for the failed step "${done.id}".`,
+          });
+        }
+      }
       continue;
     }
 
