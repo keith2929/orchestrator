@@ -20,6 +20,7 @@ import { topoSortTasks, uniqueFixId, isPlanComplete, issueSignature } from './co
 import { readTaskState, setTaskState, runningEntries, classifyInterrupted, endAttempt, isStalled, shouldBlock } from './core/taskState.js';
 import crypto from 'node:crypto';
 import { extractKeywords, lessonTopicKey, rankLessons, backfillLesson } from './core/lessons.js';
+import { formatSessionContextBlock, rolloverContent, windowPlannerChat } from './core/sessionContext.js';
 
 // Load .env into process.env FIRST — before any module below captures a snapshot
 // of the environment (e.g. shared.js CHILD_ENV) or reads a key. env.js loads on
@@ -929,10 +930,13 @@ async function handlePostPlannerChat(req, res) {
   const messages = readPlannerChat();
   messages.push({ role: 'user', content: message, ts: Date.now() });
 
+  // Step 9: the full transcript is still persisted below; only the REPLAY
+  // sent to the model is bounded (first turn + most recent 20) so a long
+  // planning conversation doesn't resend an ever-growing history every turn.
   let reply;
   try {
     reply = await resolveRole('planner').chat(
-      messages.map((m) => ({ role: m.role, content: m.content })),
+      windowPlannerChat(messages, 20).map((m) => ({ role: m.role, content: m.content })),
       { system: PLANNER_CHAT_SYSTEM }
     );
   } catch (e) {
@@ -1268,6 +1272,10 @@ async function handleRunOne(res, id) {
         : `▶️ ${task.id} — ${task.description} [${task.assigned_model}/${task.effort}]`,
   });
 
+  // Step 9: snapshot the dirty tree BEFORE this task runs, so its own
+  // session_context.md entry can list only what IT changed.
+  const beforeFiles = await gitChangedFiles(cwd);
+
   const runFn = task.type === 'tool' ? runToolNode : runTask;
   const { ok, rateLimited } = await runFn(task, cwd, (payload) => sse(res, payload));
   if (clientGone) return;
@@ -1297,7 +1305,7 @@ async function handleRunOne(res, id) {
   } else {
     markTaskCompleted(id);
     sse(res, { type: 'task-complete', id: task.id, message: `✅ ${task.id} done.` });
-    await appendSessionContext(task.id, cwd);
+    await appendSessionContext(task.id, cwd, beforeFiles);
     await recordLesson(task);
   }
 
@@ -1579,15 +1587,41 @@ function ensureStateDirIgnored(targetDir) {
   }
 }
 
-// Feature 4: append a completion note (task id + changed files) to
+// Step 9: cap on session_context.md before rolling the older half out to a
+// dated archive under .orchestrator/history/ — otherwise it grows unbounded
+// across a long unattended run.
+const SESSION_CONTEXT_CAP_BYTES = 256 * 1024;
+function rolloverSessionContextIfNeeded() {
+  let content;
+  try {
+    content = fs.readFileSync(FILES.sessionContext, 'utf8');
+  } catch {
+    return; // doesn't exist yet
+  }
+  const split = rolloverContent(content, SESSION_CONTEXT_CAP_BYTES);
+  if (!split) return;
+  try {
+    const historyDir = path.join(getStateDir(), 'history');
+    fs.mkdirSync(historyDir, { recursive: true });
+    const archivePath = path.join(historyDir, `session_context-${new Date().toISOString().slice(0, 10)}.md`);
+    fs.appendFileSync(archivePath, split.archived);
+    fs.writeFileSync(FILES.sessionContext, split.kept);
+  } catch {
+    /* best-effort */
+  }
+}
+
+// Feature 4 / Step 9: append a completion note (task id + changed files) to
 // session_context.md so later tasks are told what earlier ones produced.
-async function appendSessionContext(taskId, cwd) {
-  const files = await gitChangedFiles(cwd);
-  const block =
-    `\n---\n` +
-    `Task ${taskId} completed. Changed files: ${files.length ? files.join(', ') : '(none detected)'}\n`;
+// `beforeFiles` is the dirty-tree snapshot taken right before this task
+// started — diffing against it means only THIS task's own changes are
+// listed, not every earlier task's leftovers still sitting in the tree.
+async function appendSessionContext(taskId, cwd, beforeFiles = []) {
+  const afterFiles = await gitChangedFiles(cwd);
+  const block = formatSessionContextBlock(taskId, beforeFiles, afterFiles);
   try {
     fs.appendFileSync(FILES.sessionContext, block);
+    rolloverSessionContextIfNeeded();
   } catch {
     /* best-effort */
   }
@@ -2459,9 +2493,12 @@ async function runLoop({ skipEndOfRunExtras = false } = {}) {
             ? `🔧 ${t.id} — ${t.description} [tool:${t.tool}]${t.exclusive ? ' [exclusive]' : ''}`
             : `▶️ ${t.id} — ${t.description} [${t.assigned_model}/${t.effort}]`,
       });
+      // Step 9: snapshot the dirty tree right before this task starts, so its
+      // session_context.md entry can be scoped to only what IT changed.
+      const beforeFiles = await gitChangedFiles(cwd);
       inFlight.set(
         t.id,
-        (t.type === 'tool' ? runToolNode : runTask)(t, cwd, broadcast).then((r) => ({ id: t.id, task: t, ...r }))
+        (t.type === 'tool' ? runToolNode : runTask)(t, cwd, broadcast).then((r) => ({ id: t.id, task: t, beforeFiles, ...r }))
       );
       launched = true;
 
@@ -2548,8 +2585,9 @@ async function runLoop({ skipEndOfRunExtras = false } = {}) {
     markTaskCompleted(done.id);
     broadcast({ type: 'task-complete', id: done.id, message: `✅ ${done.id} done.` });
 
-    // Feature 4: record what this task changed for downstream tasks to read.
-    await appendSessionContext(done.id, cwd);
+    // Feature 4 / Step 9: record what this task changed for downstream tasks
+    // to read — scoped to just its own changes via the pre-launch snapshot.
+    await appendSessionContext(done.id, cwd, done.beforeFiles);
     // Feature 6: if this task had failed before (error log present), distill and
     // store the lesson learned, then clear the error log.
     await recordLesson(done.task);
