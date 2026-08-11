@@ -98,6 +98,8 @@
       .badge.done { background: #14361f; color: var(--accent-2); }
       .badge.aborted { background: #3a1c1c; color: var(--danger); }
       .badge.running { background: #3a2a12; color: #ffab5c; }
+      .badge.tool-node { background: var(--panel-2); color: var(--muted); border: 1px solid var(--border); cursor: help; }
+      .muted { color: var(--muted); }
       tr.running { background: rgba(255, 171, 92, 0.10); }
       @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
       .badge.running { animation: pulse 1.2s ease-in-out infinite; }
@@ -261,6 +263,7 @@
             <button id="splitBtn" title="Ask the model to split oversized/complex tasks">🔬 Split Tasks</button>
             <button id="auditBtn" title="Ask the auditor model to review whether the completed work meets the requirements">🔎 Audit</button>
             <button class="run" id="runBtn">▶️ Run All Pending</button>
+            <button class="run" id="goalBtn" title="Run to completion unattended: run pending tasks, audit, heal/replan on gaps, repeat (capped at 5 cycles)">🎯 Run to Goal</button>
             <button class="retry-all" id="retryAllBtn" title="Clear all aborted tasks — reset them to Pending">↻ Retry All Aborted</button>
           </span>
         </h2>

@@ -26,9 +26,16 @@ import { setEnvKey } from './env.js';
 import { resolveRole } from './roles.js';
 import { runRole } from './roles/index.js';
 import { listModels } from './clients/index.js';
-import { getRolesConfig, getClientsConfig, CONTEXT_DIR, detectRateLimit } from './shared.js';
+import { getRolesConfig, getClientsConfig, CONTEXT_DIR, detectRateLimit, parseRetryAfterMs } from './shared.js';
 import { execute } from './execution/index.js';
 import { checkClaudeAuth } from './execution/native.js';
+import { createToolRunner } from './agent/toolRunner.js';
+import { toolList } from './agent/tools/index.js';
+import { getRecipe, recipeList } from './graph/recipes/index.js';
+import { detectProjectProfile } from './graph/projectProfile.js';
+import { mineCandidates, annotateCandidate, normalize as normalizeText } from './graph/recipeMiner.js';
+import { buildIndex, resolveSection } from './graph/masterPromptIndex.js';
+import { assembleLoopPrompt } from './graph/loopPrompt.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
@@ -68,6 +75,9 @@ const STATE_FILENAMES = {
   sessionContext: 'session_context.md', // Feature 4: stitching
   memory: 'memory.json', // Feature 6: lessons learned
   plannerChat: 'planner_chat.json', // Durable "chat with the planner" transcript
+  pause: 'pause.json', // Phase 4: { reason, resumeAt } while auto-paused on a provider limit
+  recipeNotes: 'recipe-notes.json', // Phase 8: { [recipeId]: string[] } — lessons graduated into recipe hints
+  customRecipes: 'recipes.json', // Phase 9: human-approved recipes mined from this project's own history
 };
 
 // <targetDir>/.orchestrator/ — created on first access. Reads config.json
@@ -214,8 +224,129 @@ function topoSortTasks(tasks) {
   for (const t of tasks) visit(t);
   return ordered;
 }
+// ---------------------------------------------------------------------------
+// Phase 7: recipe expansion. A type:"recipe" node ({ id, type, depends_on,
+// recipe, params }) is a REFERENCE, never executed directly — it is replaced
+// here by the concrete type:"tool" node chain its expand(params, profile)
+// produces, wired depends_on -> depends_on -> ... so the recipe's internal
+// order is preserved and the first step inherits the recipe node's own
+// dependencies. Runs on every writeTasks() call, so it doesn't matter
+// whether a recipe node arrived via the API or a hand-edited tasks.json.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Phase 9: project-local custom recipes — human-approved proposals mined
+// from THIS project's own history (see graph/recipeMiner.js + the curator
+// role), stored as pure declarative data at
+// <targetDir>/.orchestrator/recipes.json. Built-in recipes (graph/recipes/)
+// still win on id collision — they ship with the codebase and are reviewed
+// by a human at authoring time, not runtime.
+// ---------------------------------------------------------------------------
+function readCustomRecipes(cwd) {
+  const file = path.join(cwd, '.orchestrator', 'recipes.json');
+  const list = readJson(file, []);
+  return Array.isArray(list) ? list : [];
+}
+function writeCustomRecipes(cwd, list) {
+  const file = path.join(cwd, '.orchestrator', 'recipes.json');
+  writeJson(file, list);
+}
+
+// Mechanically turns a curator-proposed step's args into concrete values by
+// substituting "{{paramName}}" inside string values — NEVER eval, never a
+// model-authored function body. A param with no supplied value leaves its
+// placeholder untouched rather than guessing.
+function substituteParams(value, params) {
+  if (typeof value === 'string') {
+    return value.replace(/\{\{(\w+)\}\}/g, (m, name) => (name in params ? String(params[name]) : m));
+  }
+  if (Array.isArray(value)) return value.map((v) => substituteParams(v, params));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, substituteParams(v, params)]));
+  }
+  return value;
+}
+
+// Built-ins first, then this project's own approved recipes. A custom
+// recipe's `expand` is mechanically constructed here from its stored
+// `steps` — the registry, not the model, turns data into code.
+function getRecipeForProject(id, cwd) {
+  const builtin = getRecipe(id);
+  if (builtin) return builtin;
+  const custom = readCustomRecipes(cwd).find((r) => r.id === id);
+  if (!custom) return null;
+  return {
+    ...custom,
+    expand(params) {
+      return substituteParams(custom.steps, params || {});
+    },
+  };
+}
+
+function expandRecipeNodes(tasks, cwd) {
+  if (!tasks.some((t) => t.type === 'recipe')) return tasks;
+  const profile = detectProjectProfile(cwd);
+  const out = [];
+  for (const t of tasks) {
+    if (t.type !== 'recipe') {
+      out.push(t);
+      continue;
+    }
+    const recipe = getRecipeForProject(t.recipe, cwd);
+    if (!recipe) {
+      throw new Error(`Node "${t.id}" references unknown recipe "${t.recipe}".`);
+    }
+    let steps;
+    try {
+      steps = recipe.expand(t.params || {}, profile);
+    } catch (e) {
+      throw new Error(`Recipe "${t.recipe}" failed to expand for node "${t.id}": ${e.message}`);
+    }
+    if (!Array.isArray(steps) || steps.length === 0) {
+      throw new Error(`Recipe "${t.recipe}" produced no steps for node "${t.id}" — nothing to run.`);
+    }
+    let prevIds = Array.isArray(t.depends_on) ? t.depends_on : [];
+    steps.forEach((step, i) => {
+      const stepId = `${t.id}.${i + 1}`;
+      const node = {
+        id: stepId,
+        type: 'tool',
+        description: step.description || `${recipe.id} step ${i + 1}: ${step.tool}(${JSON.stringify(step.args || {})})`,
+        depends_on: prevIds,
+        tool: step.tool,
+        args: step.args || {},
+      };
+      // exclusive/onFailureHint are the recipe's own properties (a barrier
+      // and diagnostic text respectively); onFailure is the graph author's
+      // choice per invocation, not baked into the recipe module.
+      // recipeHintFor (Phase 8) folds in whatever this project has since
+      // learned about this recipe's failure modes, on top of its static text.
+      if (recipe.exclusive) node.exclusive = true;
+      const hint = recipeHintFor(recipe.id, cwd);
+      if (hint) node.onFailureHint = hint;
+      if (t.onFailure) node.onFailure = t.onFailure;
+      out.push(node);
+      prevIds = [stepId];
+    });
+  }
+  return out;
+}
+
+// Auto-inserted fix-task ids need a uniqueness suffix — plain `${baseId}.fix`
+// collides if the same node fails twice across retries.
+function uniqueFixId(baseId, existingIds) {
+  let candidate = `${baseId}.fix`;
+  let n = 2;
+  while (existingIds.has(candidate)) {
+    candidate = `${baseId}.fix${n}`;
+    n++;
+  }
+  return candidate;
+}
+
 function writeTasks(tasks) {
-  const ordered = topoSortTasks(tasks);
+  const cwd = getConfig().targetDir || process.cwd();
+  const expanded = expandRecipeNodes(tasks, cwd);
+  const ordered = topoSortTasks(expanded);
   writeJson(FILES.tasks, ordered);
   return ordered;
 }
@@ -236,6 +367,17 @@ function markTaskCompleted(id) {
     arr.push(id);
     writeJson(FILES.completed, arr);
   }
+}
+
+// Phase 10: a plan is COMPLETE when every node has reached a terminal state
+// (done or aborted). Checked after ANY task settles — the unified scheduler
+// (every while-loop iteration) and handleRunOne (single-task manual runs) —
+// not just once at end-of-run, so "is this plan finished" is answered the
+// same way everywhere instead of re-derived ad hoc per call site.
+function isPlanComplete(tasks, completedIds, abortedIds) {
+  const completed = new Set(completedIds);
+  const aborted = new Set(abortedIds);
+  return (tasks || []).every((t) => completed.has(t.id) || aborted.has(t.id));
 }
 
 // One-shot LLM calls used by the planner-adjacent features (split, self-healing
@@ -279,26 +421,117 @@ function clearRunning() {
 const runningControllers = new Map();
 
 // ---------------------------------------------------------------------------
-// Feature 6: failure memory. memory.json is an array of lessons learned from
-// tasks that failed and were then fixed. The most recent few are fed back into
-// the implementation and splitter prompts as "previous mistakes to avoid".
+// Feature 6 / Phase 8: failure memory. memory.json is a small residual list
+// of lessons learned from tasks that failed and were then fixed — "residual"
+// because a lesson whose failure matches a known recipe now graduates into
+// that recipe's onFailureHint (see recordLesson/appendRecipeNote below)
+// instead of staying here forever. What's left is ranked by RELEVANCE to the
+// task at hand, not blind recency — a CSS task must never see SEC EDGAR
+// lessons just because they're the 5 most recent.
 // ---------------------------------------------------------------------------
 function readMemory() {
   const m = readJson(FILES.memory, []);
   return Array.isArray(m) ? m : [];
 }
-function recentLessons(n = 5) {
-  return readMemory().slice(-n);
+
+// Cheap, deterministic, zero-LLM keyword extraction — used both to tag a
+// lesson at write time and to rank stored lessons against a task's own text
+// at read time. Not NLP-grade; it only needs to catch obvious overlap
+// ("edgar", "wacc", "beta") to keep an unrelated task's prompt clean.
+const KEYWORD_STOPWORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'but', 'of', 'to', 'in', 'on', 'for', 'with',
+  'is', 'are', 'be', 'this', 'that', 'it', 'as', 'at', 'by', 'from', 'into',
+  'your', 'you', 'if', 'not', 'no', 'was', 'were', 'will', 'must', 'should',
+]);
+function extractKeywords(text, max = 12) {
+  const words = String(text || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length > 3 && !KEYWORD_STOPWORDS.has(w));
+  return [...new Set(words)].slice(0, max);
 }
-// Prompt fragment listing recent lessons, or [] when there are none.
-function lessonsBlock() {
-  const lessons = recentLessons(5);
-  if (!lessons.length) return [];
+
+// A stable identity for "what this lesson is about", used to supersede a
+// stale/contradicting entry rather than let both sit in the list forever —
+// ranking alone doesn't fix two lessons that flatly disagree. Prefers the
+// files touched (strongest signal), then the lesson's own top keywords, and
+// only falls back to the originating task id (so re-failing the exact same
+// task at least supersedes its own prior entry).
+function lessonTopicKey(entry) {
+  if (Array.isArray(entry.files) && entry.files.length) return entry.files.slice().sort().join('|');
+  if (Array.isArray(entry.keywords) && entry.keywords.length >= 2) return entry.keywords.slice(0, 2).sort().join('|');
+  return entry.taskId || entry.id;
+}
+
+function lessonRelevance(lesson, keywords, files) {
+  let score = 0;
+  const lessonFiles = Array.isArray(lesson.files) ? lesson.files : [];
+  const lessonKeywords = Array.isArray(lesson.keywords) ? lesson.keywords : [];
+  for (const f of files) if (lessonFiles.includes(f)) score += 5; // an exact file match is a strong signal
+  for (const k of keywords) if (lessonKeywords.includes(k)) score += 1;
+  return score;
+}
+
+// Prompt fragment listing the stored lessons relevant to `ctx` — a single
+// task, or (for the splitter) an array of candidate tasks — ranked by
+// keyword/file overlap, or [] when nothing overlaps at all. This is the
+// fix for both "every task prompt" and "every splitter prompt" blindly
+// inlining the same last-5-by-recency list regardless of relevance.
+function lessonsBlock(ctx, n = 3) {
+  const tasksArr = Array.isArray(ctx) ? ctx : ctx ? [ctx] : [];
+  const keywords = extractKeywords(tasksArr.map((t) => t.description || '').join(' '));
+  const files = tasksArr.flatMap((t) => (Array.isArray(t.files) ? t.files : []));
+
+  const relevant = readMemory()
+    .map((l) => ({ l, score: lessonRelevance(l, keywords, files) }))
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, n)
+    .map((s) => s.l);
+
+  if (!relevant.length) return [];
   return [
     '',
-    'PREVIOUS MISTAKES TO AVOID (lessons from earlier failed tasks):',
-    ...lessons.map((l, i) => `  ${i + 1}. ${l.lesson || l.error_summary || '(no detail)'}`),
+    'PREVIOUS MISTAKES TO AVOID (lessons from earlier failed tasks, relevant to this one):',
+    ...relevant.map((l, i) => `  ${i + 1}. ${l.lesson || l.error_summary || '(no detail)'}`),
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8: recipe field notes. A lesson the lessoner matched to a built-in
+// recipe graduates OUT of the flat memory.json list and into that recipe's
+// onFailureHint instead — permanent, always surfaced for that failure mode,
+// and costs nothing to show (vs. competing for a top-N slot forever). Stored
+// per-project since the failure pattern is about this codebase, not the
+// recipe itself.
+// ---------------------------------------------------------------------------
+const MAX_NOTES_PER_RECIPE = 5;
+function readRecipeNotes() {
+  const n = readJson(FILES.recipeNotes, {});
+  return n && typeof n === 'object' ? n : {};
+}
+function appendRecipeNote(recipeId, note) {
+  const text = String(note || '').trim();
+  if (!text) return;
+  const notes = readRecipeNotes();
+  const list = Array.isArray(notes[recipeId]) ? notes[recipeId] : [];
+  if (list.includes(text)) return; // don't pile up literal duplicates
+  list.push(text);
+  while (list.length > MAX_NOTES_PER_RECIPE) list.shift(); // bounded; newest wins
+  notes[recipeId] = list;
+  writeJson(FILES.recipeNotes, notes);
+}
+// The hint actually surfaced on an expanded recipe node: the recipe
+// module's own static text (built-in or custom), plus whatever this project
+// has since learned.
+function recipeHintFor(recipeId, cwd) {
+  const recipe = getRecipeForProject(recipeId, cwd);
+  const base = (recipe && recipe.onFailureHint) || '';
+  const notes = readRecipeNotes()[recipeId] || [];
+  if (!notes.length) return base;
+  return [base, '', 'Also learned from past failures on this project:', ...notes.map((n) => `- ${n}`)]
+    .filter(Boolean)
+    .join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +608,26 @@ function workerModelMenu() {
   return { refs, menu, fallback: refs[0] || 'claude:sonnet' };
 }
 
+// Phase 6: the tools the splitter may fold a mechanical tail into. Excludes
+// task_complete — that's an agent-loop-internal completion signal, not a
+// standalone deterministic step. Names are validated against this same list
+// (roles/shared.js normalizeToolNode) so a hallucinated tool name is rejected
+// rather than silently persisted into a node the scheduler can't run.
+function toolMenu() {
+  const eligible = toolList.filter((t) => t.name !== 'task_complete');
+  const names = eligible.map((t) => t.name);
+  const menu = eligible.map((t) => `  "${t.name}" — ${t.description}`).join('\n');
+  return { names, menu };
+}
+
+// Phase 8: given to the lessoner so matched_recipe names a recipe that
+// actually exists instead of guessing blind — recordLesson only graduates a
+// lesson into a recipe's notes when getRecipe(matched_recipe) resolves.
+function recipeMenu() {
+  const menu = recipeList.map((r) => `  "${r.id}" — ${r.description}`).join('\n');
+  return { names: recipeList.map((r) => r.id), menu };
+}
+
 // ---------------------------------------------------------------------------
 // Route: POST /api/plan
 // ---------------------------------------------------------------------------
@@ -424,21 +677,41 @@ async function handlePlan(req, res) {
 // Ask the LLM to break oversized/complex tasks into sub-tasks (parentID.a, .b),
 // then overwrite tasks.json with the expanded list. Recent failure lessons are
 // injected so the splitter avoids re-creating splits that previously blew up.
+// A task is worth the splitter's attention only if it's missing a
+// green_test (so there's no way to tell when it's actually done) or its
+// effort is high/ultracode (large enough to plausibly need breaking up).
+// Tool/recipe nodes are mechanical, not prose — splitting doesn't apply.
+function isSplitCandidate(t) {
+  if (t.type === 'tool' || t.type === 'recipe') return false;
+  return !t.green_test || t.effort === 'high' || t.effort === 'ultracode';
+}
+
 async function handleSplit(req, res) {
   const tasks = readJson(FILES.tasks, []);
   if (!Array.isArray(tasks) || tasks.length === 0) {
     return sendJson(res, 400, { error: 'No tasks to split. Generate a plan first.' });
   }
 
-  const { menu, fallback } = workerModelMenu();
+  // Phase 8: send only the candidates, not JSON.stringify(the entire plan) —
+  // O(whole plan) input tokens to split one task doesn't scale. Everything
+  // else passes through untouched.
+  const candidates = tasks.filter(isSplitCandidate);
+  if (candidates.length === 0) {
+    return sendJson(res, 200, { tasks, note: 'Nothing to split — every task already has a green_test and low/medium effort.' });
+  }
 
-  let expanded;
+  const { menu, fallback } = workerModelMenu();
+  const { names: toolNames, menu: toolMenuText } = toolMenu();
+
+  let splitResult;
   try {
-    expanded = await runRole('splitter', {
-      tasks,
+    splitResult = await runRole('splitter', {
+      tasks: candidates,
       menu,
       fallback,
-      lessons: lessonsBlock(),
+      lessons: lessonsBlock(candidates),
+      toolMenu: toolMenuText,
+      toolNames,
       cwd: getConfig().targetDir || process.cwd(),
     });
   } catch (e) {
@@ -449,8 +722,41 @@ async function handleSplit(req, res) {
     });
   }
 
+  // Merge the splitter's output (covering only `candidates`) back into the
+  // full plan: each output entry belongs to a candidate if its id is that
+  // candidate's id (untouched) or "<candidateId>.<suffix>" (split), per the
+  // splitter's own "parentID.a, parentID.b" naming convention. Anything the
+  // splitter emitted that doesn't match a candidate (a hallucinated new id)
+  // is appended rather than silently dropped.
+  const belongsTo = (entry, candidateId) => entry.id === candidateId || entry.id.startsWith(`${candidateId}.`);
+  const consumed = new Set();
+  const merged = [];
+  for (const t of tasks) {
+    if (!isSplitCandidate(t)) {
+      merged.push(t);
+      continue;
+    }
+    const produced = splitResult.filter((e) => belongsTo(e, t.id));
+    if (produced.length) {
+      produced.forEach((e) => {
+        consumed.add(e.id);
+        // Phase 10: the splitter's own schema doesn't ask for source_section,
+        // so a split sub-task would otherwise lose the pointer entirely —
+        // inherit it mechanically from the parent candidate instead.
+        if (!e.source_section && t.source_section) e.source_section = t.source_section;
+      });
+      merged.push(...produced);
+    } else {
+      merged.push(t); // splitter dropped it — keep the original rather than losing it
+    }
+  }
+  for (const e of splitResult) {
+    if (!consumed.has(e.id)) merged.push(e);
+  }
+
+  let expanded;
   try {
-    expanded = writeTasks(expanded);
+    expanded = writeTasks(merged);
   } catch (e) {
     return sendJson(res, 502, { error: 'Splitter produced an invalid task graph.', detail: e.message });
   }
@@ -698,7 +1004,12 @@ async function runAudit(cwd) {
   const aborted = new Set(readJson(FILES.aborted, []));
   const taskLines = (Array.isArray(tasks) ? tasks : []).map((t) => {
     const status = completed.has(t.id) ? 'DONE' : aborted.has(t.id) ? 'ABORTED' : 'PENDING';
-    return `- [${status}] ${t.id} (${t.assigned_model}): ${t.description}`;
+    // Phase 10: green_test was collected at split time but never actually
+    // sent to the auditor — without it, the auditor has no way to know a
+    // task already has its own settled definition of done and re-litigates
+    // it instead of focusing on real gaps.
+    const test = t.green_test ? ` [green_test: ${t.green_test}]` : '';
+    return `- [${status}] ${t.id} (${t.assigned_model}): ${t.description}${test}`;
   });
   let sessionCtx = '';
   try {
@@ -727,6 +1038,107 @@ async function handleAudit(res) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 9: post-mortem recipe mining. Detection (mineCandidates,
+// annotateCandidate) is pure code, zero LLM; this wraps it with ONE bounded
+// recipeCurator call per candidate that isn't already covered by an existing
+// recipe. Never auto-promoted — see handleApproveRecipe.
+// ---------------------------------------------------------------------------
+async function mineAndCurateRecipes(cwd) {
+  const clusters = mineCandidates({ tasksPath: FILES.tasks, memoryPath: FILES.memory, logsDir: LOGS_DIR });
+  const profile = detectProjectProfile(cwd);
+  const { menu: toolMenuText, names: toolNames } = toolMenu();
+
+  const results = [];
+  for (const cluster of clusters) {
+    const annotated = annotateCandidate(cluster, profile);
+    if (annotated.matchesExistingRecipe) {
+      results.push({
+        ...annotated,
+        proposal: null,
+        note: `Already covered by the "${annotated.matchesExistingRecipe}" recipe — no new recipe needed.`,
+      });
+      continue;
+    }
+    try {
+      const proposal = await runRole('recipeCurator', {
+        examples: annotated.members.map((m) => m.text).slice(0, 5),
+        toolMenu: toolMenuText,
+        toolNames,
+        profile,
+        matchesProfileScripts: annotated.matchesProfileScripts,
+      });
+      results.push({ ...annotated, proposal });
+    } catch (e) {
+      results.push({ ...annotated, proposal: null, error: e.message });
+    }
+  }
+  return results;
+}
+
+async function handleMineRecipes(res) {
+  const cwd = getConfig().targetDir || process.cwd();
+  try {
+    sendJson(res, 200, { candidates: await mineAndCurateRecipes(cwd) });
+  } catch (e) {
+    sendJson(res, 500, { error: 'Recipe mining failed.', detail: e.message });
+  }
+}
+
+// POST /api/recipes/approve — the human-approval gate. Body: { recipe: {
+// id, description, params?, steps, onFailureHint? } } (a proposal from
+// POST /api/recipes/mine, possibly hand-edited first). Landing a recipe is
+// just appending validated data to this project's recipes.json — nothing
+// executable is ever written.
+async function handleApproveRecipe(req, res) {
+  const body = await readBody(req);
+  const proposal = body.recipe;
+  if (!proposal || typeof proposal !== 'object') {
+    return sendJson(res, 400, { error: 'Missing "recipe" in request body.' });
+  }
+  const id = String(proposal.id || '').trim();
+  if (!/^[a-z][a-z0-9-]*$/.test(id)) {
+    return sendJson(res, 400, { error: `Invalid recipe id: ${JSON.stringify(proposal.id)}` });
+  }
+  if (getRecipe(id)) {
+    return sendJson(res, 400, { error: `"${id}" collides with a built-in recipe id — choose another.` });
+  }
+  const { names: toolNames } = toolMenu();
+  const steps = Array.isArray(proposal.steps) ? proposal.steps : [];
+  if (!steps.length) return sendJson(res, 400, { error: 'Recipe has no steps.' });
+  for (let i = 0; i < steps.length; i++) {
+    if (!steps[i] || !toolNames.includes(steps[i].tool)) {
+      return sendJson(res, 400, { error: `Step ${i + 1} references unknown tool "${steps[i] && steps[i].tool}".` });
+    }
+  }
+
+  const cwd = getConfig().targetDir || process.cwd();
+  const list = readCustomRecipes(cwd).filter((r) => r.id !== id); // supersede a same-id re-approval
+  const saved = {
+    id,
+    description: proposal.description || '(no description)',
+    params: proposal.params && typeof proposal.params === 'object' ? proposal.params : {},
+    steps: steps.map((s) => ({ tool: s.tool, args: s.args && typeof s.args === 'object' ? s.args : {} })),
+    onFailureHint: proposal.onFailureHint || '',
+    approvedAt: new Date().toISOString(),
+  };
+  list.push(saved);
+  writeCustomRecipes(cwd, list);
+  sendJson(res, 200, { recipe: saved });
+}
+
+function handleGetRecipes(res) {
+  const cwd = getConfig().targetDir || process.cwd();
+  const builtins = recipeList.map((r) => ({ id: r.id, description: r.description, source: 'built-in' }));
+  const custom = readCustomRecipes(cwd).map((r) => ({
+    id: r.id,
+    description: r.description,
+    source: 'custom',
+    approvedAt: r.approvedAt,
+  }));
+  sendJson(res, 200, { recipes: [...builtins, ...custom] });
+}
+
+// ---------------------------------------------------------------------------
 // Route: POST /api/concurrency — set the max tasks in flight at once.
 // Body: { maxConcurrency: number }. 1 reproduces the old "sequential" mode;
 // there is no longer a separate scheduler to switch to (see Phase 2).
@@ -750,7 +1162,7 @@ async function handlePutTask(req, res, id) {
   const idx = tasks.findIndex((t) => t.id === id);
   if (idx === -1) return sendJson(res, 404, { error: `No task with id "${id}".` });
 
-  const allowed = ['description', 'assigned_model', 'effort', 'depends_on'];
+  const allowed = ['description', 'assigned_model', 'effort', 'depends_on', 'type', 'tool', 'args', 'onFailure', 'recipe', 'params'];
   for (const key of allowed) {
     if (key in patch) tasks[idx][key] = patch[key];
   }
@@ -790,7 +1202,11 @@ async function handleRetryTask(res, id) {
     /* no error log — fall through to the plain un-abort */
   }
 
-  if (errorLog.trim()) {
+  // Tool nodes have no prompt for a suggested_fix to feed into — a shell
+  // command either works or it doesn't, and the retry re-runs it verbatim
+  // (e.g. a transient `npm install` network blip). Skip the healer LLM call
+  // entirely rather than produce advice nothing will ever read.
+  if (errorLog.trim() && tasks[idx].type !== 'tool') {
     try {
       const heal = await runRole('healer', { taskId: id, description: tasks[idx].description, errorLog });
       suggested_fix = heal.fix_summary || null;
@@ -831,7 +1247,17 @@ async function handleRunOne(res, id) {
     clientGone = true;
   });
 
-  const tasks = readJson(FILES.tasks, []);
+  // Phase 7: catch an unexpanded recipe node here too (see runLoop) — a
+  // hand-edited tasks.json might get a manual "Start" click before ever
+  // going through a full run.
+  let tasks;
+  try {
+    tasks = writeTasks(readJson(FILES.tasks, []));
+  } catch (e) {
+    sse(res, { type: 'error', message: `⛔ Invalid task graph: ${e.message}` });
+    sse(res, { type: 'done', message: 'done' });
+    return res.end();
+  }
   const task = tasks.find((t) => t.id === id);
   if (!task) {
     sse(res, { type: 'error', message: `No task with id "${id}".` });
@@ -847,13 +1273,17 @@ async function handleRunOne(res, id) {
   const cfg = getConfig();
   const cwd = cfg.targetDir || process.cwd();
 
-  sse(res, { type: 'status', message: '🔐 Checking claude CLI login…' });
-  const auth = await checkClaudeAuth();
-  if (!auth.ok) {
-    sse(res, { type: 'error', message: `⛔ ${auth.message}` });
-    sse(res, { type: 'done', message: `⛔ Run stopped before starting — ${auth.message}` });
-    if (!clientGone) res.end();
-    return;
+  // Tool nodes never touch a provider — skip the claude-CLI login preflight
+  // entirely rather than block a zero-LLM step on an unrelated login check.
+  if (task.type !== 'tool') {
+    sse(res, { type: 'status', message: '🔐 Checking claude CLI login…' });
+    const auth = await checkClaudeAuth();
+    if (!auth.ok) {
+      sse(res, { type: 'error', message: `⛔ ${auth.message}` });
+      sse(res, { type: 'done', message: `⛔ Run stopped before starting — ${auth.message}` });
+      if (!clientGone) res.end();
+      return;
+    }
   }
 
   // Starting a task manually clears any prior aborted mark, same as retry.
@@ -862,10 +1292,14 @@ async function handleRunOne(res, id) {
   sse(res, {
     type: 'task-start',
     id: task.id,
-    message: `▶️ ${task.id} — ${task.description} [${task.assigned_model}/${task.effort}]`,
+    message:
+      task.type === 'tool'
+        ? `🔧 ${task.id} — ${task.description} [tool:${task.tool}]`
+        : `▶️ ${task.id} — ${task.description} [${task.assigned_model}/${task.effort}]`,
   });
 
-  const { ok, rateLimited } = await runTask(task, cwd, res);
+  const runFn = task.type === 'tool' ? runToolNode : runTask;
+  const { ok, rateLimited } = await runFn(task, cwd, (payload) => sse(res, payload));
   if (clientGone) return;
 
   // A provider limit isn't this task's fault — leave it PENDING rather than
@@ -897,7 +1331,11 @@ async function handleRunOne(res, id) {
     await recordLesson(task);
   }
 
-  sse(res, { type: 'done', message: ok ? '✅ Task finished.' : '⛔ Task failed.' });
+  // Phase 10: checked here too, not just at end of a bulk run — a plan
+  // finished one manual "Start" click at a time is just as complete.
+  const allTasks = readJson(FILES.tasks, []);
+  const complete = isPlanComplete(allTasks, readJson(FILES.completed, []), readJson(FILES.aborted, []));
+  sse(res, { type: 'done', planComplete: complete, message: ok ? '✅ Task finished.' : '⛔ Task failed.' });
   if (!clientGone) res.end();
 }
 
@@ -1094,15 +1532,40 @@ async function recordLesson(task) {
   }
 
   try {
-    const lesson = await runRole('lessoner', { taskId: task.id, description: task.description, errorLog });
-    const mem = readMemory();
-    mem.push({
-      id: `mem-${Date.now()}`,
+    const { menu: recipeMenuText } = recipeMenu();
+    const lesson = await runRole('lessoner', {
       taskId: task.id,
-      ...lesson,
-      created_at: new Date().toISOString(),
+      description: task.description,
+      errorLog,
+      recipeMenu: recipeMenuText,
     });
-    writeJson(FILES.memory, mem);
+
+    // Graduate: a lesson matched to a real recipe folds into that recipe's
+    // onFailureHint (permanent, always surfaced there) instead of competing
+    // for a slot in the flat residual list. A hallucinated/unknown id falls
+    // straight through to the normal path below.
+    const matchedRecipe = lesson.matched_recipe && getRecipe(lesson.matched_recipe);
+    if (matchedRecipe) {
+      appendRecipeNote(matchedRecipe.id, lesson.lesson || lesson.fix || lesson.error_summary);
+    } else {
+      const keywords = extractKeywords(
+        `${task.description} ${lesson.error_summary || ''} ${lesson.root_cause || ''}`
+      );
+      const entry = {
+        id: `mem-${Date.now()}`,
+        taskId: task.id,
+        ...lesson,
+        keywords,
+        files: Array.isArray(task.files) ? task.files : [],
+        created_at: new Date().toISOString(),
+      };
+      // Supersede: an existing entry about the same topic is replaced, not
+      // just outranked — two lessons that flatly contradict each other is a
+      // ranking problem ranking alone can't fix.
+      const mem = readMemory().filter((e) => lessonTopicKey(e) !== lessonTopicKey(entry));
+      mem.push(entry);
+      writeJson(FILES.memory, mem);
+    }
   } catch {
     /* best-effort: a failed lesson write must not disrupt the run */
   }
@@ -1145,7 +1608,13 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 // "analyzer" has no dedicated role by default → resolveRole falls back to the
 // planner model (this was the cheap `fable` pass before the refactor).
 async function analyzeFiles(tasks, cwd) {
-  const need = tasks.filter((t) => !Array.isArray(t.files));
+  // Phase 6: tool nodes never go through the LLM guesser — normalizeToolNode
+  // already derived a static files[] where the tool's args make that possible
+  // (write_file/append_file/mkdir); everything else intentionally runs solo
+  // (see the "unknownFiles" handling in the scheduler). Either way, asking
+  // the analyzer to guess a shell command's file footprint would be a
+  // pointless LLM call for a node designed to cost zero.
+  const need = tasks.filter((t) => t.type !== 'tool' && !Array.isArray(t.files));
   if (need.length === 0) return tasks;
 
   let ann;
@@ -1165,7 +1634,7 @@ async function analyzeFiles(tasks, cwd) {
   return tasks;
 }
 
-function runTask(task, cwd, res) {
+function runTask(task, cwd, emit) {
   return new Promise((resolve) => {
     const contextFiles = listContextFiles();
     const contextBlock = contextFiles.length
@@ -1190,8 +1659,8 @@ function runTask(task, cwd, res) {
         ]
       : [];
 
-    // Feature 6: recent lessons learned from previously-failed tasks.
-    const lessons = lessonsBlock();
+    // Feature 6 / Phase 8: lessons relevant to THIS task, not just recent ones.
+    const lessons = lessonsBlock(task);
 
     // Feature 3: if a self-healing retry produced a suggested fix, hand it to
     // the subprocess as a starting point.
@@ -1270,15 +1739,15 @@ function runTask(task, cwd, res) {
       let buf = (isErr ? errBuf : outBuf) + raw;
       let nl;
       while ((nl = buf.indexOf('\n')) !== -1) {
-        sse(res, { type: 'log', log: `[${task.id}] ${buf.slice(0, nl)}\n` });
+        emit({ type: 'log', log: `[${task.id}] ${buf.slice(0, nl)}\n` });
         buf = buf.slice(nl + 1);
       }
       if (isErr) errBuf = buf;
       else outBuf = buf;
     };
     const flush = () => {
-      if (outBuf) sse(res, { type: 'log', log: `[${task.id}] ${outBuf}\n` });
-      if (errBuf) sse(res, { type: 'log', log: `[${task.id}] ${errBuf}\n` });
+      if (outBuf) emit({ type: 'log', log: `[${task.id}] ${outBuf}\n` });
+      if (errBuf) emit({ type: 'log', log: `[${task.id}] ${errBuf}\n` });
       outBuf = errBuf = '';
     };
 
@@ -1350,6 +1819,139 @@ function runTask(task, cwd, res) {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 6: mechanical type:"tool" nodes. Zero LLM involvement — runs the
+// named tool directly via createToolRunner instead of building a worker
+// prompt, but shares the same running.json/log-file/error-log/abort-
+// controller plumbing as runTask so the rest of the scheduler and the UI
+// don't need to know the difference. A failure writes error_logs/{id}.txt
+// from the tool's own result — self-healing/lesson capture is triggered by
+// the exit code, not an LLM's self-report.
+// ---------------------------------------------------------------------------
+function runToolNode(node, cwd, emit) {
+  return new Promise((resolve) => {
+    addRunning(node.id);
+    const controller = new AbortController();
+    runningControllers.set(node.id, controller);
+
+    const logPath = path.join(LOGS_DIR, `${node.id}.log`);
+    let logStream = null;
+    try {
+      logStream = fs.createWriteStream(logPath, { flags: 'w' });
+    } catch {
+      /* best-effort: streaming still works without the on-disk log */
+    }
+
+    let outAll = '';
+    const OUT_CAP = 16000;
+    const onLog = (line) => {
+      if (logStream) {
+        try {
+          logStream.write(line);
+        } catch {
+          /* ignore log write errors */
+        }
+      }
+      outAll = (outAll + line).slice(-OUT_CAP);
+      emit({ type: 'log', log: `[${node.id}] ${line}` });
+    };
+
+    (async () => {
+      let result;
+      if (node.recipe) {
+        // Schema accepted ahead of the registry that will interpret it —
+        // see REDESIGN_PLAN.md Phase 7. Fails loud rather than silently
+        // no-op-ing a node the plan expects to have run.
+        result = { ok: false, error: `Recipe nodes are not runnable yet (Phase 7): "${node.recipe}"` };
+      } else {
+        const runner = createToolRunner({ cwd, limits: {}, onLog });
+        try {
+          result = await runner.run(node.tool, node.args || {});
+        } catch (e) {
+          result = { ok: false, error: e.message };
+        }
+      }
+
+      removeRunning(node.id);
+      runningControllers.delete(node.id);
+      if (logStream) {
+        try {
+          logStream.end();
+        } catch {
+          /* ignore */
+        }
+      }
+
+      if (!result.ok) {
+        // result.error covers most tools (bad args, path escape, unknown
+        // tool); run_bash instead reports stdout/stderr/exitCode with no
+        // `error` field — without pulling those in, the error log would hold
+        // only the toolRunner's one-line summary, not the command's actual
+        // output, which is exactly what self-healing/lesson capture needs.
+        const parts = [];
+        if (result.error) parts.push(String(result.error));
+        if (typeof result.exitCode === 'number') parts.push(`exit code: ${result.exitCode}`);
+        if (result.stderr) parts.push(`--- stderr ---\n${result.stderr}`);
+        if (result.stdout) parts.push(`--- stdout ---\n${result.stdout}`);
+        const errText = parts.join('\n\n').trim() || outAll.trim();
+        try {
+          fs.writeFileSync(path.join(ERROR_LOGS_DIR, `${node.id}.txt`), errText || '(no output captured)');
+        } catch {
+          /* best-effort */
+        }
+      }
+      // Tool nodes never touch a provider, so a rate-limit pause never
+      // applies to them.
+      resolve({ ok: !!result.ok, rateLimited: null });
+    })();
+  });
+}
+
+// Phase 7: onFailure:"spawn-task". A tool node's failure normally just
+// aborts it (see the scheduler below) — this additionally seeds a NEW,
+// independent task with the recipe's onFailureHint plus the captured error,
+// so the next run has something actionable instead of a dead end the user
+// has to diagnose from scratch. Inserted via writeTasks, so it's
+// topologically valid the moment it lands.
+function spawnFixTask(node, cwd) {
+  const tasks = readJson(FILES.tasks, []);
+  const existingIds = new Set(tasks.map((t) => t.id));
+  const id = uniqueFixId(node.id, existingIds);
+
+  let errorText = '';
+  try {
+    errorText = fs.readFileSync(path.join(ERROR_LOGS_DIR, `${node.id}.txt`), 'utf8');
+  } catch {
+    /* nothing captured */
+  }
+
+  const description = [
+    node.onFailureHint || `The step "${node.id}" (${node.description}) failed. Diagnose and fix it.`,
+    '',
+    `Failed step: ${node.id} — ${node.description}`,
+    errorText ? `\n=== ERROR LOG ===\n${errorText.slice(0, 4000)}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const fix = {
+    id,
+    description,
+    assigned_model: workerModelMenu().fallback,
+    effort: 'medium',
+    depends_on: [],
+  };
+  tasks.push(fix);
+  try {
+    writeTasks(tasks);
+  } catch (e) {
+    // Best-effort: a malformed insertion must not crash the run.
+    console.error(`[spawn-task] failed to insert fix task for ${node.id}: ${e.message}`);
+    return null;
+  }
+  return id;
+}
+
+// ---------------------------------------------------------------------------
 // The run loop. Unified in Phase 2: there is one scheduler, built on what was
 // previously "concurrent mode"'s depsMet logic — it always follows the real
 // depends_on graph (re-read fresh each iteration), never array position.
@@ -1359,6 +1961,112 @@ function runTask(task, cwd, res) {
 // silently diverged from the graph the moment a UI edit, a re-split, or the
 // planner emitted tasks out of topological order (see REDESIGN_PLAN.md).
 // ---------------------------------------------------------------------------
+// Run manager (Phase 4): the run loop is a server-owned process, not tied to
+// one HTTP request. GET /api/run subscribes the response to live broadcast()
+// output and starts runLoop() if one isn't already active; closing the tab or
+// losing the connection only drops that subscription — the loop keeps going.
+// A genuine stop is now an explicit action (POST /api/run/stop), since
+// connection loss no longer implies "stop".
+// ---------------------------------------------------------------------------
+const DEFAULT_PAUSE_BACKOFF_MS = 5 * 60 * 1000; // used when the provider gave no reset hint
+const MAX_PAUSE_BACKOFF_MS = 30 * 60 * 1000;
+
+const runManager = {
+  active: false,
+  subscribers: new Set(), // Set<res>
+  stopRequested: false,
+  resumeTimer: null,
+};
+
+function broadcast(payload) {
+  for (const res of runManager.subscribers) sse(res, payload);
+}
+function subscribeRun(res) {
+  runManager.subscribers.add(res);
+  res.on('close', () => runManager.subscribers.delete(res));
+}
+
+function clearPause() {
+  if (runManager.resumeTimer) {
+    clearTimeout(runManager.resumeTimer);
+    runManager.resumeTimer = null;
+  }
+  try {
+    fs.unlinkSync(FILES.pause);
+  } catch {
+    /* already gone */
+  }
+}
+
+// Persists { reason, resumeAt } and schedules an unattended re-invocation of
+// runLoop — "press Run again once the limit resets" becomes automatic. Honors
+// a provider-stated wait (parseRetryAfterMs) when present, else a conservative
+// fixed backoff that grows on repeated pauses (capped) so a persistent outage
+// doesn't hammer the provider every 5 minutes forever.
+function schedulePauseResume(reason) {
+  const prior = readJson(FILES.pause, null);
+  const streak = prior && prior.reason === reason ? (prior.streak || 1) + 1 : 1;
+  const waitMs = Math.min(
+    parseRetryAfterMs(reason) || DEFAULT_PAUSE_BACKOFF_MS * streak,
+    MAX_PAUSE_BACKOFF_MS
+  );
+  const resumeAt = Date.now() + waitMs;
+  writeJson(FILES.pause, { reason, resumeAt, streak });
+  if (runManager.resumeTimer) clearTimeout(runManager.resumeTimer);
+  runManager.resumeTimer = setTimeout(() => {
+    runManager.resumeTimer = null;
+    try {
+      fs.unlinkSync(FILES.pause);
+    } catch {
+      /* already gone */
+    }
+    broadcast({ type: 'status', message: '▶️ Auto-resuming after provider limit…' });
+    startRunLoop();
+  }, waitMs);
+  return resumeAt;
+}
+
+// Called once at boot: a pause.json left over from a backend restart mid-pause
+// must still resume unattended, not silently wait forever for a click.
+function resumeStalePauseOnBoot() {
+  const pause = readJson(FILES.pause, null);
+  if (!pause || !pause.resumeAt) return;
+  const remaining = pause.resumeAt - Date.now();
+  if (remaining <= 0) {
+    try {
+      fs.unlinkSync(FILES.pause);
+    } catch {
+      /* ignore */
+    }
+    startRunLoop();
+  } else {
+    runManager.resumeTimer = setTimeout(() => {
+      runManager.resumeTimer = null;
+      try {
+        fs.unlinkSync(FILES.pause);
+      } catch {
+        /* ignore */
+      }
+      startRunLoop();
+    }, remaining);
+  }
+}
+
+// Starts runLoop() if one isn't already active. Fire-and-forget — callers
+// (handleRun, the auto-resume timer) do not await this.
+function startRunLoop() {
+  if (runManager.active) return;
+  runManager.active = true;
+  runManager.stopRequested = false;
+  runLoop()
+    .catch((e) => {
+      broadcast({ type: 'error', message: `⛔ Run crashed: ${e.message}` });
+    })
+    .finally(() => {
+      runManager.active = false;
+    });
+}
+
 async function handleRun(res) {
   setCors(res);
   res.writeHead(200, {
@@ -1366,7 +2074,86 @@ async function handleRun(res) {
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
   });
+  subscribeRun(res);
 
+  if (runManager.active) {
+    sse(res, { type: 'status', message: '📡 Reattached to an in-progress run.' });
+    return;
+  }
+  const pause = readJson(FILES.pause, null);
+  if (pause) {
+    sse(res, {
+      type: 'paused',
+      message: `⏸️ Paused — ${pause.reason}. Auto-resuming at ${new Date(pause.resumeAt).toLocaleTimeString()}.`,
+    });
+    return;
+  }
+  startRunLoop();
+}
+
+// Phase 10: same detach/subscribe/resume pattern as the ordinary run loop
+// (startRunLoop/handleRun) — the goal loop is just a different top-level
+// driver over the same runManager, so it gets connection resilience,
+// reattachment, and POST /api/run/stop for free.
+function startGoalLoop() {
+  if (runManager.active) return;
+  runManager.active = true;
+  runManager.stopRequested = false;
+  runGoalLoop()
+    .catch((e) => {
+      broadcast({ type: 'error', message: `⛔ Goal loop crashed: ${e.message}` });
+    })
+    .finally(() => {
+      runManager.active = false;
+    });
+}
+
+async function handleGoalStart(res) {
+  setCors(res);
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  subscribeRun(res);
+
+  if (runManager.active) {
+    sse(res, { type: 'status', message: '📡 Reattached to an in-progress run.' });
+    return;
+  }
+  if (!fs.existsSync(FILES.master)) {
+    sse(res, { type: 'error', message: '⛔ No MASTER_PROMPT.md — generate a plan first.' });
+    sse(res, { type: 'done', message: 'done' });
+    return;
+  }
+  startGoalLoop();
+}
+
+// POST /api/run/stop — the explicit stop that used to be implied by closing
+// the SSE connection (Phase 2 and earlier). Cancels any pending auto-resume
+// too, since a user-requested stop should not silently restart itself.
+// Stops whichever driver (ordinary run or goal loop) is currently active.
+function handleStopRun(res) {
+  runManager.stopRequested = true;
+  clearPause();
+  broadcast({ type: 'status', message: '⏹️ Stop requested — finishing in-flight task(s), then stopping.' });
+  sendJson(res, 200, { stopping: true });
+}
+
+// ---------------------------------------------------------------------------
+// The run loop. Unified in Phase 2: there is one scheduler, built on what was
+// previously "concurrent mode"'s depsMet logic — it always follows the real
+// depends_on graph (re-read fresh each iteration), never array position.
+// maxConcurrency=1 reproduces the old "sequential" guarantee (one task at a
+// time, real dependency order) without a second code path; the old sequential
+// mode's bug was that it used array position INSTEAD of depends_on, which
+// silently diverged from the graph the moment a UI edit, a re-split, or the
+// planner emitted tasks out of topological order (see REDESIGN_PLAN.md).
+//
+// Phase 4: detached from any single HTTP request — see runManager above.
+// stopRequested (not clientGone) is now the only thing that halts the loop.
+// ---------------------------------------------------------------------------
+async function runLoop({ skipEndOfRunExtras = false } = {}) {
   const cfg = getConfig();
   const cwd = cfg.targetDir || process.cwd();
   // Max tasks in flight at once. Tasks only actually run in parallel when
@@ -1377,10 +2164,19 @@ async function handleRun(res) {
     Number(process.env.CONCURRENCY) || Number(cfg.maxConcurrency) || DEFAULT_MAX_CONCURRENCY
   );
 
-  let clientGone = false;
-  res.on('close', () => {
-    clientGone = true;
-  });
+  const stopped = () => runManager.stopRequested;
+
+  // Phase 7: a recipe node normally gets expanded the moment it's written
+  // (writeTasks), but tasks.json can also be hand-edited directly — catch an
+  // unexpanded recipe node here too, defensively, before the loop ever tries
+  // to run something it doesn't know how to execute.
+  try {
+    writeTasks(readJson(FILES.tasks, []));
+  } catch (e) {
+    broadcast({ type: 'error', message: `⛔ Invalid task graph: ${e.message}` });
+    broadcast({ type: 'done', message: `⛔ Run stopped before starting — ${e.message}` });
+    return;
+  }
 
   // Feature 2: clear any stale "running" entries left by a previously crashed or
   // force-closed run before we start fresh.
@@ -1388,17 +2184,29 @@ async function handleRun(res) {
 
   // Preflight: catch "claude CLI not logged in / not installed" ONCE, up front,
   // instead of aborting every queued task with the same stderr one by one.
-  sse(res, { type: 'status', message: '🔐 Checking claude CLI login…' });
+  broadcast({ type: 'status', message: '🔐 Checking claude CLI login…' });
   const auth = await checkClaudeAuth();
   if (!auth.ok) {
-    sse(res, { type: 'error', message: `⛔ ${auth.message}` });
-    sse(res, { type: 'done', message: `⛔ Run stopped before starting — ${auth.message}` });
+    // A rate limit can trip on this ping itself, before any task ever runs —
+    // that must auto-resume too, not just stop cold (the whole point of
+    // Phase 4 is no click required).
+    if (auth.rateLimited) {
+      const resumeAt = schedulePauseResume(auth.message);
+      broadcast({
+        type: 'paused',
+        message: `⏸️ ${auth.message} — auto-resuming at ${new Date(resumeAt).toLocaleTimeString()}.`,
+      });
+      broadcast({ type: 'done', message: `⏸️ Run paused before starting — ${auth.message}` });
+      clearRunning();
+      return;
+    }
+    broadcast({ type: 'error', message: `⛔ ${auth.message}` });
+    broadcast({ type: 'done', message: `⛔ Run stopped before starting — ${auth.message}` });
     clearRunning();
-    if (!clientGone) res.end();
     return;
   }
 
-  sse(res, {
+  broadcast({
     type: 'status',
     message: `Starting run in ${cwd} — up to ${maxConc} task(s) in parallel, in dependency order`,
   });
@@ -1408,9 +2216,9 @@ async function handleRun(res) {
   // REDESIGN_PLAN.md: without this, unifying the modes would add a new LLM
   // call to every former-sequential run).
   if (maxConc > 1) {
-    sse(res, { type: 'status', message: '🔎 First pass: analyzing task file isolation (fable)…' });
+    broadcast({ type: 'status', message: '🔎 First pass: analyzing task file isolation (fable)…' });
     await analyzeFiles(readJson(FILES.tasks, []), cwd);
-    if (clientGone) return;
+    if (stopped()) return;
   }
 
   const filesInUse = new Set(); // files being edited by currently in-flight tasks
@@ -1433,7 +2241,7 @@ async function handleRun(res) {
   // untouched still pending.
   let haltedBy = null;
 
-  while (!clientGone) {
+  while (!stopped()) {
     const allTasks = readJson(FILES.tasks, []);
     const completed = new Set(readJson(FILES.completed, []));
     const isDone = (id) => completed.has(id);
@@ -1445,7 +2253,7 @@ async function handleRun(res) {
       if (isDone(t.id) || isAborted(t.id) || inFlight.has(t.id)) continue;
       if ((t.depends_on || []).some((d) => isAborted(d))) {
         markAborted(t.id);
-        sse(res, {
+        broadcast({
           type: 'task-aborted',
           id: t.id,
           message: `⛔ ${t.id} aborted — a dependency could not be completed.`,
@@ -1456,10 +2264,11 @@ async function handleRun(res) {
     const pending = allTasks.filter(
       (t) => !isDone(t.id) && !isAborted(t.id) && !inFlight.has(t.id)
     );
-    if (pending.length === 0 && inFlight.size === 0) {
+    if (pending.length === 0 && inFlight.size === 0 && isPlanComplete(allTasks, [...completed], [...abortedSet])) {
       const nAborted = allTasks.filter((t) => isAborted(t.id)).length;
-      sse(res, {
+      broadcast({
         type: 'done',
+        planComplete: true,
         message: nAborted
           ? `⚠️ Run finished — ${nAborted} task(s) aborted.`
           : '✅ All tasks complete.',
@@ -1467,54 +2276,64 @@ async function handleRun(res) {
       break;
     }
 
-    // Halted by a provider limit and everything in flight has drained.
+    // Halted by a provider limit and everything in flight has drained: pause
+    // and schedule an unattended auto-resume instead of just stopping.
     if (haltedBy && inFlight.size === 0) {
-      sse(res, {
+      const resumeAt = schedulePauseResume(haltedBy.reason);
+      broadcast({
         type: 'done',
         message:
           `⏸️ Run paused — ${haltedBy.reason}. The remaining tasks are still PENDING ` +
-          `(not aborted); press Run again once the limit resets.`,
+          `(not aborted); auto-resuming at ${new Date(resumeAt).toLocaleTimeString()}.`,
       });
       break;
     }
 
     // A task can start when its deps are done AND it doesn't clash on files.
     // A task with unknown/empty file info (analysis failed) is treated as
-    // conflicting-with-everything: it runs solo, preserving the old safe order.
+    // conflicting-with-everything: it runs solo, preserving the old safe
+    // order. Phase 7: an exclusive node (a recipe like repo-green-up that
+    // touches the whole workspace) gets the exact same solo treatment —
+    // drain in-flight work first, launch nothing else alongside it — since
+    // static path-conflict detection only knows the paths in a node's own
+    // args and can't see a workspace-wide command coming.
     const depsMet = (t) => (t.depends_on || []).every((d) => isDone(d));
     const startable = pending.filter(depsMet);
 
     let launched = false;
     for (const t of haltedBy ? [] : startable) {
       if (inFlight.size >= maxConc) break;
-      const unknownFiles = !Array.isArray(t.files) || t.files.length === 0;
-      if (unknownFiles) {
+      const soloRequired = t.exclusive || !Array.isArray(t.files) || t.files.length === 0;
+      if (soloRequired) {
         if (inFlight.size > 0) continue; // must run alone
       } else if (overlaps(t)) {
         continue; // shares a file with something in flight
       }
 
       claim(t);
-      sse(res, {
+      broadcast({
         type: 'task-start',
         id: t.id,
-        message: `▶️ ${t.id} — ${t.description} [${t.assigned_model}/${t.effort}]`,
+        message:
+          t.type === 'tool'
+            ? `🔧 ${t.id} — ${t.description} [tool:${t.tool}]${t.exclusive ? ' [exclusive]' : ''}`
+            : `▶️ ${t.id} — ${t.description} [${t.assigned_model}/${t.effort}]`,
       });
       inFlight.set(
         t.id,
-        runTask(t, cwd, res).then((r) => ({ id: t.id, task: t, ...r }))
+        (t.type === 'tool' ? runToolNode : runTask)(t, cwd, broadcast).then((r) => ({ id: t.id, task: t, ...r }))
       );
       launched = true;
 
-      if (unknownFiles) break; // solo task: don't start anything alongside it
+      if (soloRequired) break; // solo/exclusive: don't start anything alongside it
       await delay(1500); // gentle stagger between parallel launches
-      if (clientGone) break;
+      if (stopped()) break;
     }
 
     if (inFlight.size === 0) {
       // Nothing running and nothing could be launched => genuinely stuck.
       if (!launched) {
-        sse(res, {
+        broadcast({
           type: 'error',
           message:
             '⛔ Stuck: pending tasks remain but their dependencies are unmet or circular. ' +
@@ -1529,13 +2348,13 @@ async function handleRun(res) {
     const done = await Promise.race(inFlight.values());
     inFlight.delete(done.id);
     release(done.task);
-    if (clientGone) break;
+    if (stopped()) break;
 
     // A provider limit is not this task's fault and will hit every other task
     // identically, so leave it PENDING and stop launching new work.
     if (done.rateLimited) {
       haltedBy = done.rateLimited;
-      sse(res, {
+      broadcast({
         type: 'paused',
         message: `⏸️ ${done.id} did not run — ${done.rateLimited.reason}`,
       });
@@ -1547,16 +2366,25 @@ async function handleRun(res) {
       // carry on with tasks that don't depend on it (dependents cascade to
       // aborted at the top of the next loop).
       markAborted(done.id);
-      sse(res, {
+      broadcast({
         type: 'task-aborted',
         id: done.id,
         message: `❌ ${done.id} could not be completed — marked aborted. Continuing with remaining tasks.`,
       });
+      if (done.task.type === 'tool' && done.task.onFailure === 'spawn-task') {
+        const fixId = spawnFixTask(done.task, cwd);
+        if (fixId) {
+          broadcast({
+            type: 'status',
+            message: `🩹 Spawned fix task "${fixId}" for the failed step "${done.id}".`,
+          });
+        }
+      }
       continue;
     }
 
     markTaskCompleted(done.id);
-    sse(res, { type: 'task-complete', id: done.id, message: `✅ ${done.id} done.` });
+    broadcast({ type: 'task-complete', id: done.id, message: `✅ ${done.id} done.` });
 
     // Feature 4: record what this task changed for downstream tasks to read.
     await appendSessionContext(done.id, cwd);
@@ -1566,26 +2394,284 @@ async function handleRun(res) {
   }
 
   // P5: optional Auditor pass at the end of the pipeline (opt-in via
-  // config.autoAudit). Streamed before "done" so the client is still listening.
-  // Skipped when a provider limit cut the run short — the work is incomplete
-  // by definition, and the audit would only burn more of the exhausted quota.
-  if (!clientGone && !haltedBy && getConfig().autoAudit) {
-    sse(res, { type: 'status', message: '🔎 Auditor: reviewing the completed work…' });
+  // config.autoAudit). Skipped when a provider limit cut the run short — the
+  // work is incomplete by definition, and the audit would only burn more of
+  // the exhausted quota. Also skipped on an explicit stop, for the same
+  // reason, and when the goal loop (Phase 10) is driving — it runs its own
+  // audit every cycle and this would just duplicate it.
+  if (!skipEndOfRunExtras && !stopped() && !haltedBy && getConfig().autoAudit) {
+    broadcast({ type: 'status', message: '🔎 Auditor: reviewing the completed work…' });
     try {
       const audit = await runAudit(cwd);
-      sse(res, {
+      broadcast({
         type: 'audit',
         result: audit,
         message: `🔎 Audit verdict: ${String(audit.verdict).toUpperCase()} — ${audit.summary}`,
       });
     } catch (e) {
-      sse(res, { type: 'log', log: `[audit] failed: ${e.message}\n` });
+      broadcast({ type: 'log', log: `[audit] failed: ${e.message}\n` });
+    }
+  }
+
+  // Phase 9: optional recipe-mining pass (opt-in via config.autoRecipeReview,
+  // mirroring autoAudit). Purely informational — candidates are surfaced for
+  // a human to review and POST /api/recipes/approve; nothing is ever
+  // auto-promoted.
+  if (!skipEndOfRunExtras && !stopped() && !haltedBy && getConfig().autoRecipeReview) {
+    broadcast({ type: 'status', message: '🧩 Mining this run for recurring patterns…' });
+    try {
+      const candidates = await mineAndCurateRecipes(cwd);
+      broadcast({
+        type: 'recipe-candidates',
+        candidates,
+        message: candidates.length
+          ? `🧩 Found ${candidates.length} recurring pattern(s) — review with POST /api/recipes/approve.`
+          : '🧩 No recurring patterns found this run.',
+      });
+    } catch (e) {
+      broadcast({ type: 'log', log: `[recipe-mining] failed: ${e.message}\n` });
     }
   }
 
   // Feature 2: run over — nothing should still show as running.
   clearRunning();
-  if (!clientGone) res.end();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10: the goal-based autonomous loop.
+//
+//   tasks clear -> audit -> healer distills each high-severity issue
+//     -> requires_replan=false: seed affected_task.suggested_fix, requeue it
+//     -> requires_replan=true:  write loop-N.md, planner replans additively
+//     -> insert topologically-safely -> run -> repeat
+//
+// Capped at 5 cycles; an issue whose signature recurs after a heal attempt
+// is escalated (not retried identically) so a ping-pong failure can't burn
+// every remaining cycle making no progress.
+// ---------------------------------------------------------------------------
+const MAX_GOAL_CYCLES = 5;
+
+// A stable identity for "this is the same complaint as before", so a heal
+// attempt that didn't actually fix anything is detected even if the
+// auditor's wording drifts slightly between cycles. Reuses the recipe
+// miner's placeholder-normaliser rather than inventing a second one.
+function issueSignature(issue) {
+  return normalizeText(`${(issue && issue.task) || 'general'} ${(issue && issue.description) || ''}`);
+}
+
+// Un-terminals a task (drops it from completed/aborted) and seeds a
+// suggested_fix, so the next runLoop pass picks it back up as pending and
+// injects the fix into its prompt (the same fixBlock handleRetryTask
+// already uses). Returns false if the id doesn't exist — a general/
+// cross-cutting audit issue has no single task to requeue.
+function seedTaskFix(taskId, fixSummary) {
+  const tasks = readJson(FILES.tasks, []);
+  const idx = tasks.findIndex((t) => t.id === taskId);
+  if (idx === -1) return false;
+  if (fixSummary) tasks[idx].suggested_fix = fixSummary;
+  writeTasks(tasks);
+  writeJson(FILES.completed, readJson(FILES.completed, []).filter((id) => id !== taskId));
+  writeJson(FILES.aborted, readJson(FILES.aborted, []).filter((id) => id !== taskId));
+  return true;
+}
+
+// Mechanically gathers this cycle's brief (see graph/loopPrompt.js) and
+// writes it to .orchestrator/loops/loop-N.md. `healedIssues` is
+// [{ issue, heal }] — heal is the healer role's output for that issue.
+function writeLoopPrompt(cycle, healedIssues) {
+  const tasks = readJson(FILES.tasks, []);
+  const completed = new Set(readJson(FILES.completed, []));
+  const aborted = new Set(readJson(FILES.aborted, []));
+  const taskInventory = tasks.map((t) => ({
+    id: t.id,
+    status: completed.has(t.id) ? 'DONE' : aborted.has(t.id) ? 'ABORTED' : 'PENDING',
+    description: t.description || (t.tool ? `${t.tool}(${JSON.stringify(t.args || {})})` : '(no description)'),
+  }));
+
+  let master = '';
+  try {
+    master = fs.readFileSync(FILES.master, 'utf8');
+  } catch {
+    /* no master prompt */
+  }
+  const index = buildIndex(master);
+
+  // Resolution chain: audit issue -> affected task -> source_section -> slice.
+  const sectionNames = new Set();
+  for (const { issue } of healedIssues) {
+    const t = tasks.find((x) => x.id === issue.task);
+    if (t && t.source_section) sectionNames.add(t.source_section);
+  }
+  const sections = [...sectionNames]
+    .map((name) => ({ heading: name, text: resolveSection(index, name) }))
+    .filter((s) => s.text);
+
+  const text = assembleLoopPrompt({
+    cycle,
+    issues: healedIssues.map(({ issue, heal }) => ({
+      ...issue,
+      diagnosis: heal && heal.diagnosis,
+      fix_summary: heal && heal.fix_summary,
+    })),
+    taskInventory,
+    sections,
+  });
+
+  const dir = path.join(getStateDir(), 'loops');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    /* best-effort */
+  }
+  const file = path.join(dir, `loop-${cycle}.md`);
+  fs.writeFileSync(file, text);
+  return { path: file, text };
+}
+
+async function runGoalLoop() {
+  const cwd = getConfig().targetDir || process.cwd();
+  const stopped = () => runManager.stopRequested;
+  let previousSignatures = new Set();
+  const escalated = new Map(); // signature -> issue, for the final report
+
+  for (let cycle = 1; cycle <= MAX_GOAL_CYCLES; cycle++) {
+    if (stopped()) return;
+
+    broadcast({ type: 'status', message: `🎯 Goal loop cycle ${cycle}/${MAX_GOAL_CYCLES}: running pending tasks…` });
+    await runLoop({ skipEndOfRunExtras: true });
+    if (stopped()) return;
+
+    broadcast({ type: 'status', message: `🔎 Goal loop cycle ${cycle}: auditing…` });
+    let audit;
+    try {
+      audit = await runAudit(cwd);
+    } catch (e) {
+      broadcast({ type: 'error', message: `⛔ Goal loop stopped — auditor failed: ${e.message}` });
+      return;
+    }
+    broadcast({
+      type: 'audit',
+      cycle,
+      result: audit,
+      message: `🔎 Cycle ${cycle} audit: ${String(audit.verdict).toUpperCase()} — ${audit.summary}`,
+    });
+
+    if (audit.verdict === 'pass') {
+      broadcast({ type: 'goal-complete', cycle, message: `✅ Goal reached after ${cycle} cycle(s) — audit passed.` });
+      return;
+    }
+
+    const highIssues = audit.issues.filter((i) => i.severity === 'high');
+    const currentSignatures = new Set(highIssues.map(issueSignature));
+
+    // Oscillation guard: a signature that also showed up last cycle survived
+    // a heal attempt unchanged — retrying it identically would just burn the
+    // remaining cycles chasing the same ping-pong. Escalate instead.
+    const toHeal = [];
+    for (const issue of highIssues) {
+      const sig = issueSignature(issue);
+      if (previousSignatures.has(sig)) {
+        escalated.set(sig, issue);
+        broadcast({
+          type: 'status',
+          message: `⚠️ Issue recurred after a heal attempt — escalating instead of retrying: ${issue.description}`,
+        });
+      } else {
+        toHeal.push(issue);
+      }
+    }
+
+    if (!toHeal.length) {
+      broadcast({
+        type: 'goal-capped',
+        cycle,
+        escalated: [...escalated.values()],
+        message: `⛔ Every remaining issue has already been escalated — stopping at cycle ${cycle}.`,
+      });
+      return;
+    }
+
+    const healedIssues = []; // needs a replan
+    const requeued = []; // seeded + requeued directly
+    for (const issue of toHeal) {
+      if (stopped()) return;
+      let heal;
+      try {
+        heal = await runRole('healer', {
+          taskId: issue.task,
+          description: issue.description,
+          errorLog: issue.suggested_fix || issue.description,
+        });
+      } catch (e) {
+        broadcast({ type: 'log', log: `[goal-loop] healer failed for "${issue.description}": ${e.message}\n` });
+        continue;
+      }
+      if (!heal.requires_replan && seedTaskFix(heal.affected_task || issue.task, heal.fix_summary)) {
+        requeued.push(heal.affected_task || issue.task);
+      } else {
+        // Either the healer asked for a replan, or there was no concrete
+        // task to requeue (a general/cross-cutting issue) — either way this
+        // needs new work, not just a retry.
+        healedIssues.push({ issue, heal });
+      }
+    }
+
+    if (requeued.length) {
+      broadcast({
+        type: 'status',
+        message: `🩹 Requeued ${requeued.length} task(s) with a suggested fix: ${requeued.join(', ')}`,
+      });
+    }
+
+    if (healedIssues.length) {
+      const { text: loopText } = writeLoopPrompt(cycle, healedIssues);
+      broadcast({ type: 'status', message: `📝 Wrote the cycle ${cycle} replan brief — extending the plan…` });
+      const existingIds = readJson(FILES.tasks, []).map((t) => t.id);
+      const { menu, fallback } = workerModelMenu();
+      let newTasks = [];
+      try {
+        newTasks = await runRole('planner', { mode: 'replan', loopPrompt: loopText, menu, fallback, existingIds, cwd });
+      } catch (e) {
+        broadcast({ type: 'log', log: `[goal-loop] replan failed: ${e.message}\n` });
+      }
+      // Backstop (belt-and-suspenders on top of planner.normalize's own
+      // filter): never let a replanned id collide with one that already
+      // exists, completed or not.
+      const additive = newTasks.filter((t) => !existingIds.includes(t.id));
+      if (additive.length) {
+        try {
+          writeTasks([...readJson(FILES.tasks, []), ...additive]);
+          broadcast({ type: 'status', message: `➕ Replan added ${additive.length} new task(s).` });
+        } catch (e) {
+          broadcast({ type: 'log', log: `[goal-loop] failed to insert replanned tasks: ${e.message}\n` });
+        }
+      }
+    }
+
+    if (!requeued.length && !healedIssues.length) {
+      broadcast({
+        type: 'goal-capped',
+        cycle,
+        escalated: [...escalated.values()],
+        message: `⛔ No actionable fix could be produced this cycle — stopping at cycle ${cycle}.`,
+      });
+      return;
+    }
+
+    previousSignatures = currentSignatures;
+  }
+
+  // Cap reached without a passing audit.
+  const finalAudit = await runAudit(cwd).catch(() => null);
+  broadcast({
+    type: 'goal-capped',
+    cycle: MAX_GOAL_CYCLES,
+    escalated: [...escalated.values()],
+    result: finalAudit,
+    message:
+      `⛔ Reached the ${MAX_GOAL_CYCLES}-cycle cap without a clean audit. ${escalated.size} issue(s) could not be ` +
+      'resolved automatically — consider clarifying or narrowing MASTER_PROMPT.md.',
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1615,6 +2701,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && pathname === '/api/planner-chat') return await handlePostPlannerChat(req, res);
     if (req.method === 'DELETE' && pathname === '/api/planner-chat') return handleDeletePlannerChat(res);
     if (req.method === 'POST' && pathname === '/api/audit') return await handleAudit(res);
+    if (req.method === 'POST' && pathname === '/api/recipes/mine') return await handleMineRecipes(res);
+    if (req.method === 'POST' && pathname === '/api/recipes/approve') return await handleApproveRecipe(req, res);
+    if (req.method === 'GET' && pathname === '/api/recipes') return handleGetRecipes(res);
     if (req.method === 'GET' && pathname === '/api/memory') return handleGetMemory(res);
     if (req.method === 'GET' && pathname.startsWith('/api/logs/')) {
       const id = decodeURIComponent(pathname.slice('/api/logs/'.length));
@@ -1644,6 +2733,8 @@ const server = http.createServer(async (req, res) => {
       return handleDeleteContext(res, name);
     }
     if (req.method === 'GET' && pathname === '/api/run') return await handleRun(res);
+    if (req.method === 'POST' && pathname === '/api/run/stop') return handleStopRun(res);
+    if (req.method === 'GET' && pathname === '/api/goal/start') return await handleGoalStart(res);
     if (req.method === 'GET' && pathname === '/api/health') {
       return sendJson(res, 200, { ok: true });
     }
@@ -1666,4 +2757,8 @@ server.listen(PORT, () => {
   }
   console.log(`claude-orchestrator backend listening on http://localhost:${PORT}`);
   console.log(`Using claude binary: ${CLAUDE_BIN}`);
+
+  // Phase 4: a pause.json surviving a backend restart must still auto-resume
+  // — otherwise a crash/redeploy during a provider-limit pause waits forever.
+  resumeStalePauseOnBoot();
 });

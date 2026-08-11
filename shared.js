@@ -60,6 +60,7 @@ export const DEFAULT_ROLES = {
   lessoner: { client: 'claude', model: 'sonnet' },
   auditor: { client: 'claude', model: 'opus' },
   analyzer: { client: 'claude', model: 'sonnet' },
+  recipeCurator: { client: 'claude', model: 'sonnet' },
 };
 
 // ---------------------------------------------------------------------------
@@ -99,6 +100,18 @@ export function detectRateLimit(text) {
   if (!RATE_LIMIT_RE.test(s)) return null;
   const line = s.split(/\r?\n/).find((l) => RATE_LIMIT_RE.test(l)) || '';
   return { reason: line.trim().slice(0, 200) || 'provider rate/usage limit' };
+}
+
+// Providers often state how long to wait ("Please try again in 1.605s"). Used
+// both for per-request chat retries (agent/executor.js) and, since Phase 4,
+// to compute a plan-level auto-resume ETA after a run pauses on a limit —
+// same technique, two callers. Returns 0 when no duration is present (the
+// caller falls back to a fixed backoff).
+export function parseRetryAfterMs(text) {
+  const m = /(?:try again in|retry in|retry-after[:\s]*)\s*([\d.]+)\s*(ms|s\b)?/i.exec(String(text || ''));
+  if (!m) return 0;
+  const n = Number(m[1]);
+  return /ms/i.test(m[2] || '') ? n : n * 1000;
 }
 
 // Read + parse config.json, failing soft to an empty object.

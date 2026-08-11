@@ -6,6 +6,7 @@
 // dispatch, and completion detection. It never names a provider.
 import { createToolRunner } from './toolRunner.js';
 import { toolSchemas } from './tools/index.js';
+import { parseRetryAfterMs } from '../shared.js';
 
 const DEFAULT_LIMITS = {
   // 25 was not enough for a real task: orienting in a 4,200-file vault and
@@ -88,15 +89,6 @@ const TOO_LARGE = /request too large|reduce your message size|\b413\b|context.{0
 // is recoverable in-band — see the handler below.
 const UNKNOWN_TOOL = /tool_use_failed|attempted to call tool|not in request\.tools/i;
 
-// Providers state how long to wait ("Please try again in 1.605s"). Honour it —
-// a fixed backoff either wastes time or retries too early.
-function retryAfterMs(msg) {
-  const m = /(?:try again in|retry in|retry-after[:\s]*)\s*([\d.]+)\s*(ms|s\b)?/i.exec(msg);
-  if (!m) return 0;
-  const n = Number(m[1]);
-  return /ms/i.test(m[2] || '') ? n : n * 1000;
-}
-
 export async function runAgent({ client, model, systemPrompt, userPrompt, cwd, onOut, onErr, limits, readRoots, signal }) {
   const lim = { ...DEFAULT_LIMITS, ...(limits || {}) };
   const runner = createToolRunner({ cwd, limits: lim, readRoots, onLog: (line) => onOut && onOut(line) });
@@ -154,7 +146,7 @@ export async function runAgent({ client, model, systemPrompt, userPrompt, cwd, o
         }
 
         if (RETRYABLE.test(msg) && attempt < lim.chatAttempts - 1) {
-          const wait = Math.min(retryAfterMs(msg) + 500 || 2000 * (attempt + 1), 60000);
+          const wait = Math.min(parseRetryAfterMs(msg) + 500 || 2000 * (attempt + 1), 60000);
           if (Date.now() - started + wait > lim.wallClockMs) break; // no point sleeping past the deadline
           if (onOut) {
             onOut(

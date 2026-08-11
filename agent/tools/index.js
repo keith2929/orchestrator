@@ -11,8 +11,11 @@ import glob from './glob.js';
 import grep from './grep.js';
 import runBash from './runBash.js';
 import taskComplete from './taskComplete.js';
+import readCache from './readCache.js';
+import writeCache from './writeCache.js';
 
-// The agent's tool set. Filesystem read/write/search + shell + completion.
+// The agent's tool set. Filesystem read/write/search + shell + completion +
+// the project-scoped content cache (Phase 5).
 export const toolList = [
   readFile,
   writeFile,
@@ -23,6 +26,8 @@ export const toolList = [
   grep,
   runBash,
   taskComplete,
+  readCache,
+  writeCache,
 ];
 
 // name -> module, for the tool runner.
