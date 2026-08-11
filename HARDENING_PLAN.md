@@ -10,7 +10,7 @@
 
 ## Progress
 
-- [ ] Step 1 — Atomic JSON writes
+- [x] Step 1 — Atomic JSON writes
 - [ ] Step 2 — Extract pure logic into `core/`
 - [ ] Step 3 — Tests for the already-pure modules
 - [ ] Step 4 — Durable task state
