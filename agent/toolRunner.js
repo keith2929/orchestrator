@@ -41,12 +41,24 @@ export function createToolRunner({ cwd, limits, onLog, readRoots = [] }) {
     return rel.split(path.sep)[0] !== '..' && !path.isAbsolute(rel);
   };
 
+  const orchestratorDir = path.resolve(root, '.orchestrator');
+
   // Resolve a caller path against the project root and REJECT anything that
   // escapes it. Segment-based so a file literally named "..foo" is allowed while
   // a real "../" escape (or an absolute path) is not.
+  //
+  // Step 10 (hardening): this is the WRITE path (write_file/append_file/mkdir,
+  // plus grep's containment check) — resolveReadPath below is deliberately
+  // untouched, since workers are told to read session_context.md. A chat
+  // worker's tool calls are the enforceable half of this rule (the Claude CLI
+  // can't be sandboxed at all; the worker prompt just tells it not to write
+  // there — see server.js). Self-corrupting the recipe store / memory.json /
+  // tasks.json mid-run is a real risk on a long unattended run, not a
+  // hypothetical one this guards against.
   function resolvePath(p) {
     const target = path.resolve(root, String(p ?? ''));
     if (!within(target, root)) throw new Error(`path escapes the project directory: ${p}`);
+    if (within(target, orchestratorDir)) throw new Error(`workers may not write under .orchestrator/: ${p}`);
     return target;
   }
 

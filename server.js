@@ -1800,6 +1800,8 @@ function runTask(task, cwd, emit) {
       `verify the task. The environment is non-interactive (CI=true) — prefer flags`,
       `that avoid prompts, and do NOT skip a required step out of caution; carry it`,
       `out. Do not delete or wipe existing node_modules or unrelated files.`,
+      `Never write to anything under .orchestrator/ — that directory is the`,
+      `orchestrator's own state (tasks, recipes, memory) and is off-limits to workers.`,
       ...contextBlock,
       ...sessionBlock,
       ...lessons,
