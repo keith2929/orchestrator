@@ -16,7 +16,7 @@
 - [x] Step 4 — Durable task state
 - [x] Step 5 — Crash recovery
 - [x] Step 6 — Worker timeout, stall and repetition guards
-- [ ] Step 7 — Resurrect `memory.json`
+- [x] Step 7 — Resurrect `memory.json`
 - [ ] Step 8 — Project-scope `logs/` and `error_logs/`
 - [ ] Step 9 — Bound worker context
 - [ ] Step 10 — Workers cannot mutate the knowledge base
