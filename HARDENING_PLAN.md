@@ -18,7 +18,7 @@
 - [x] Step 6 — Worker timeout, stall and repetition guards
 - [x] Step 7 — Resurrect `memory.json`
 - [x] Step 8 — Project-scope `logs/` and `error_logs/`
-- [ ] Step 9 — Bound worker context
+- [x] Step 9 — Bound worker context
 - [ ] Step 10 — Workers cannot mutate the knowledge base
 - [ ] Step 11 — Recipes as versioned files
 - [ ] Step 12 — Lesson compaction into recipes
