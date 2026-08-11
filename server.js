@@ -31,7 +31,7 @@ import { execute } from './execution/index.js';
 import { checkClaudeAuth } from './execution/native.js';
 import { createToolRunner } from './agent/toolRunner.js';
 import { toolList } from './agent/tools/index.js';
-import { getRecipe } from './graph/recipes/index.js';
+import { getRecipe, recipeList } from './graph/recipes/index.js';
 import { detectProjectProfile } from './graph/projectProfile.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -73,6 +73,7 @@ const STATE_FILENAMES = {
   memory: 'memory.json', // Feature 6: lessons learned
   plannerChat: 'planner_chat.json', // Durable "chat with the planner" transcript
   pause: 'pause.json', // Phase 4: { reason, resumeAt } while auto-paused on a provider limit
+  recipeNotes: 'recipe-notes.json', // Phase 8: { [recipeId]: string[] } — lessons graduated into recipe hints
 };
 
 // <targetDir>/.orchestrator/ — created on first access. Reads config.json
@@ -264,8 +265,11 @@ function expandRecipeNodes(tasks, cwd) {
       // exclusive/onFailureHint are the recipe's own properties (a barrier
       // and diagnostic text respectively); onFailure is the graph author's
       // choice per invocation, not baked into the recipe module.
+      // recipeHintFor (Phase 8) folds in whatever this project has since
+      // learned about this recipe's failure modes, on top of its static text.
       if (recipe.exclusive) node.exclusive = true;
-      if (recipe.onFailureHint) node.onFailureHint = recipe.onFailureHint;
+      const hint = recipeHintFor(recipe.id);
+      if (hint) node.onFailureHint = hint;
       if (t.onFailure) node.onFailure = t.onFailure;
       out.push(node);
       prevIds = [stepId];
@@ -353,26 +357,116 @@ function clearRunning() {
 const runningControllers = new Map();
 
 // ---------------------------------------------------------------------------
-// Feature 6: failure memory. memory.json is an array of lessons learned from
-// tasks that failed and were then fixed. The most recent few are fed back into
-// the implementation and splitter prompts as "previous mistakes to avoid".
+// Feature 6 / Phase 8: failure memory. memory.json is a small residual list
+// of lessons learned from tasks that failed and were then fixed — "residual"
+// because a lesson whose failure matches a known recipe now graduates into
+// that recipe's onFailureHint (see recordLesson/appendRecipeNote below)
+// instead of staying here forever. What's left is ranked by RELEVANCE to the
+// task at hand, not blind recency — a CSS task must never see SEC EDGAR
+// lessons just because they're the 5 most recent.
 // ---------------------------------------------------------------------------
 function readMemory() {
   const m = readJson(FILES.memory, []);
   return Array.isArray(m) ? m : [];
 }
-function recentLessons(n = 5) {
-  return readMemory().slice(-n);
+
+// Cheap, deterministic, zero-LLM keyword extraction — used both to tag a
+// lesson at write time and to rank stored lessons against a task's own text
+// at read time. Not NLP-grade; it only needs to catch obvious overlap
+// ("edgar", "wacc", "beta") to keep an unrelated task's prompt clean.
+const KEYWORD_STOPWORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'but', 'of', 'to', 'in', 'on', 'for', 'with',
+  'is', 'are', 'be', 'this', 'that', 'it', 'as', 'at', 'by', 'from', 'into',
+  'your', 'you', 'if', 'not', 'no', 'was', 'were', 'will', 'must', 'should',
+]);
+function extractKeywords(text, max = 12) {
+  const words = String(text || '')
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((w) => w.length > 3 && !KEYWORD_STOPWORDS.has(w));
+  return [...new Set(words)].slice(0, max);
 }
-// Prompt fragment listing recent lessons, or [] when there are none.
-function lessonsBlock() {
-  const lessons = recentLessons(5);
-  if (!lessons.length) return [];
+
+// A stable identity for "what this lesson is about", used to supersede a
+// stale/contradicting entry rather than let both sit in the list forever —
+// ranking alone doesn't fix two lessons that flatly disagree. Prefers the
+// files touched (strongest signal), then the lesson's own top keywords, and
+// only falls back to the originating task id (so re-failing the exact same
+// task at least supersedes its own prior entry).
+function lessonTopicKey(entry) {
+  if (Array.isArray(entry.files) && entry.files.length) return entry.files.slice().sort().join('|');
+  if (Array.isArray(entry.keywords) && entry.keywords.length >= 2) return entry.keywords.slice(0, 2).sort().join('|');
+  return entry.taskId || entry.id;
+}
+
+function lessonRelevance(lesson, keywords, files) {
+  let score = 0;
+  const lessonFiles = Array.isArray(lesson.files) ? lesson.files : [];
+  const lessonKeywords = Array.isArray(lesson.keywords) ? lesson.keywords : [];
+  for (const f of files) if (lessonFiles.includes(f)) score += 5; // an exact file match is a strong signal
+  for (const k of keywords) if (lessonKeywords.includes(k)) score += 1;
+  return score;
+}
+
+// Prompt fragment listing the stored lessons relevant to `ctx` — a single
+// task, or (for the splitter) an array of candidate tasks — ranked by
+// keyword/file overlap, or [] when nothing overlaps at all. This is the
+// fix for both "every task prompt" and "every splitter prompt" blindly
+// inlining the same last-5-by-recency list regardless of relevance.
+function lessonsBlock(ctx, n = 3) {
+  const tasksArr = Array.isArray(ctx) ? ctx : ctx ? [ctx] : [];
+  const keywords = extractKeywords(tasksArr.map((t) => t.description || '').join(' '));
+  const files = tasksArr.flatMap((t) => (Array.isArray(t.files) ? t.files : []));
+
+  const relevant = readMemory()
+    .map((l) => ({ l, score: lessonRelevance(l, keywords, files) }))
+    .filter((s) => s.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, n)
+    .map((s) => s.l);
+
+  if (!relevant.length) return [];
   return [
     '',
-    'PREVIOUS MISTAKES TO AVOID (lessons from earlier failed tasks):',
-    ...lessons.map((l, i) => `  ${i + 1}. ${l.lesson || l.error_summary || '(no detail)'}`),
+    'PREVIOUS MISTAKES TO AVOID (lessons from earlier failed tasks, relevant to this one):',
+    ...relevant.map((l, i) => `  ${i + 1}. ${l.lesson || l.error_summary || '(no detail)'}`),
   ];
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8: recipe field notes. A lesson the lessoner matched to a built-in
+// recipe graduates OUT of the flat memory.json list and into that recipe's
+// onFailureHint instead — permanent, always surfaced for that failure mode,
+// and costs nothing to show (vs. competing for a top-N slot forever). Stored
+// per-project since the failure pattern is about this codebase, not the
+// recipe itself.
+// ---------------------------------------------------------------------------
+const MAX_NOTES_PER_RECIPE = 5;
+function readRecipeNotes() {
+  const n = readJson(FILES.recipeNotes, {});
+  return n && typeof n === 'object' ? n : {};
+}
+function appendRecipeNote(recipeId, note) {
+  const text = String(note || '').trim();
+  if (!text) return;
+  const notes = readRecipeNotes();
+  const list = Array.isArray(notes[recipeId]) ? notes[recipeId] : [];
+  if (list.includes(text)) return; // don't pile up literal duplicates
+  list.push(text);
+  while (list.length > MAX_NOTES_PER_RECIPE) list.shift(); // bounded; newest wins
+  notes[recipeId] = list;
+  writeJson(FILES.recipeNotes, notes);
+}
+// The hint actually surfaced on an expanded recipe node: the recipe
+// module's own static text, plus whatever this project has since learned.
+function recipeHintFor(recipeId) {
+  const recipe = getRecipe(recipeId);
+  const base = (recipe && recipe.onFailureHint) || '';
+  const notes = readRecipeNotes()[recipeId] || [];
+  if (!notes.length) return base;
+  return [base, '', 'Also learned from past failures on this project:', ...notes.map((n) => `- ${n}`)]
+    .filter(Boolean)
+    .join('\n');
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +555,14 @@ function toolMenu() {
   return { names, menu };
 }
 
+// Phase 8: given to the lessoner so matched_recipe names a recipe that
+// actually exists instead of guessing blind — recordLesson only graduates a
+// lesson into a recipe's notes when getRecipe(matched_recipe) resolves.
+function recipeMenu() {
+  const menu = recipeList.map((r) => `  "${r.id}" — ${r.description}`).join('\n');
+  return { names: recipeList.map((r) => r.id), menu };
+}
+
 // ---------------------------------------------------------------------------
 // Route: POST /api/plan
 // ---------------------------------------------------------------------------
@@ -510,22 +612,39 @@ async function handlePlan(req, res) {
 // Ask the LLM to break oversized/complex tasks into sub-tasks (parentID.a, .b),
 // then overwrite tasks.json with the expanded list. Recent failure lessons are
 // injected so the splitter avoids re-creating splits that previously blew up.
+// A task is worth the splitter's attention only if it's missing a
+// green_test (so there's no way to tell when it's actually done) or its
+// effort is high/ultracode (large enough to plausibly need breaking up).
+// Tool/recipe nodes are mechanical, not prose — splitting doesn't apply.
+function isSplitCandidate(t) {
+  if (t.type === 'tool' || t.type === 'recipe') return false;
+  return !t.green_test || t.effort === 'high' || t.effort === 'ultracode';
+}
+
 async function handleSplit(req, res) {
   const tasks = readJson(FILES.tasks, []);
   if (!Array.isArray(tasks) || tasks.length === 0) {
     return sendJson(res, 400, { error: 'No tasks to split. Generate a plan first.' });
   }
 
+  // Phase 8: send only the candidates, not JSON.stringify(the entire plan) —
+  // O(whole plan) input tokens to split one task doesn't scale. Everything
+  // else passes through untouched.
+  const candidates = tasks.filter(isSplitCandidate);
+  if (candidates.length === 0) {
+    return sendJson(res, 200, { tasks, note: 'Nothing to split — every task already has a green_test and low/medium effort.' });
+  }
+
   const { menu, fallback } = workerModelMenu();
   const { names: toolNames, menu: toolMenuText } = toolMenu();
 
-  let expanded;
+  let splitResult;
   try {
-    expanded = await runRole('splitter', {
-      tasks,
+    splitResult = await runRole('splitter', {
+      tasks: candidates,
       menu,
       fallback,
-      lessons: lessonsBlock(),
+      lessons: lessonsBlock(candidates),
       toolMenu: toolMenuText,
       toolNames,
       cwd: getConfig().targetDir || process.cwd(),
@@ -538,8 +657,35 @@ async function handleSplit(req, res) {
     });
   }
 
+  // Merge the splitter's output (covering only `candidates`) back into the
+  // full plan: each output entry belongs to a candidate if its id is that
+  // candidate's id (untouched) or "<candidateId>.<suffix>" (split), per the
+  // splitter's own "parentID.a, parentID.b" naming convention. Anything the
+  // splitter emitted that doesn't match a candidate (a hallucinated new id)
+  // is appended rather than silently dropped.
+  const belongsTo = (entry, candidateId) => entry.id === candidateId || entry.id.startsWith(`${candidateId}.`);
+  const consumed = new Set();
+  const merged = [];
+  for (const t of tasks) {
+    if (!isSplitCandidate(t)) {
+      merged.push(t);
+      continue;
+    }
+    const produced = splitResult.filter((e) => belongsTo(e, t.id));
+    if (produced.length) {
+      produced.forEach((e) => consumed.add(e.id));
+      merged.push(...produced);
+    } else {
+      merged.push(t); // splitter dropped it — keep the original rather than losing it
+    }
+  }
+  for (const e of splitResult) {
+    if (!consumed.has(e.id)) merged.push(e);
+  }
+
+  let expanded;
   try {
-    expanded = writeTasks(expanded);
+    expanded = writeTasks(merged);
   } catch (e) {
     return sendJson(res, 502, { error: 'Splitter produced an invalid task graph.', detail: e.message });
   }
@@ -1205,15 +1351,40 @@ async function recordLesson(task) {
   }
 
   try {
-    const lesson = await runRole('lessoner', { taskId: task.id, description: task.description, errorLog });
-    const mem = readMemory();
-    mem.push({
-      id: `mem-${Date.now()}`,
+    const { menu: recipeMenuText } = recipeMenu();
+    const lesson = await runRole('lessoner', {
       taskId: task.id,
-      ...lesson,
-      created_at: new Date().toISOString(),
+      description: task.description,
+      errorLog,
+      recipeMenu: recipeMenuText,
     });
-    writeJson(FILES.memory, mem);
+
+    // Graduate: a lesson matched to a real recipe folds into that recipe's
+    // onFailureHint (permanent, always surfaced there) instead of competing
+    // for a slot in the flat residual list. A hallucinated/unknown id falls
+    // straight through to the normal path below.
+    const matchedRecipe = lesson.matched_recipe && getRecipe(lesson.matched_recipe);
+    if (matchedRecipe) {
+      appendRecipeNote(matchedRecipe.id, lesson.lesson || lesson.fix || lesson.error_summary);
+    } else {
+      const keywords = extractKeywords(
+        `${task.description} ${lesson.error_summary || ''} ${lesson.root_cause || ''}`
+      );
+      const entry = {
+        id: `mem-${Date.now()}`,
+        taskId: task.id,
+        ...lesson,
+        keywords,
+        files: Array.isArray(task.files) ? task.files : [],
+        created_at: new Date().toISOString(),
+      };
+      // Supersede: an existing entry about the same topic is replaced, not
+      // just outranked — two lessons that flatly contradict each other is a
+      // ranking problem ranking alone can't fix.
+      const mem = readMemory().filter((e) => lessonTopicKey(e) !== lessonTopicKey(entry));
+      mem.push(entry);
+      writeJson(FILES.memory, mem);
+    }
   } catch {
     /* best-effort: a failed lesson write must not disrupt the run */
   }
@@ -1307,8 +1478,8 @@ function runTask(task, cwd, emit) {
         ]
       : [];
 
-    // Feature 6: recent lessons learned from previously-failed tasks.
-    const lessons = lessonsBlock();
+    // Feature 6 / Phase 8: lessons relevant to THIS task, not just recent ones.
+    const lessons = lessonsBlock(task);
 
     // Feature 3: if a self-healing retry produced a suggested fix, hand it to
     // the subprocess as a starting point.
