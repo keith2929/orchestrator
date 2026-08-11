@@ -15,7 +15,7 @@
 - [x] Step 3 — Tests for the already-pure modules
 - [x] Step 4 — Durable task state
 - [x] Step 5 — Crash recovery
-- [ ] Step 6 — Worker timeout, stall and repetition guards
+- [x] Step 6 — Worker timeout, stall and repetition guards
 - [ ] Step 7 — Resurrect `memory.json`
 - [ ] Step 8 — Project-scope `logs/` and `error_logs/`
 - [ ] Step 9 — Bound worker context
