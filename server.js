@@ -17,7 +17,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readJson, writeJson, readJsonFile } from './core/jsonStore.js';
 import { topoSortTasks, uniqueFixId, isPlanComplete, issueSignature } from './core/taskGraph.js';
-import { readTaskState, setTaskState, runningEntries } from './core/taskState.js';
+import { readTaskState, setTaskState, runningEntries, classifyInterrupted } from './core/taskState.js';
+import crypto from 'node:crypto';
 import { extractKeywords, lessonTopicKey, rankLessons } from './core/lessons.js';
 
 // Load .env into process.env FIRST — before any module below captures a snapshot
@@ -1389,6 +1390,118 @@ function gitChangedFiles(cwd) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Step 5: crash recovery. Runs at boot and at the top of every runLoop pass,
+// over every task_state.json record still marked 'in_progress'. Evidence —
+// the record's own gitBaseline, the CURRENT git state, and whether every
+// dependency is done — decides what happens next; see core/taskState.js's
+// classifyInterrupted for the ladder. This replaces the old blind
+// clearRunning() wipe: a task that already changed the repo is now verified
+// or requeued with continuation context instead of silently re-run from
+// scratch.
+// ---------------------------------------------------------------------------
+function currentGitState(cwd) {
+  return new Promise((resolve) => {
+    execFile('git', ['-C', cwd, 'rev-parse', 'HEAD'], { shell: IS_WIN }, (err, stdout) => {
+      const head = err ? null : String(stdout).trim();
+      execFile(
+        'git',
+        ['-C', cwd, 'status', '--porcelain'],
+        { maxBuffer: 4 * 1024 * 1024, shell: IS_WIN },
+        (err2, stdout2) => {
+          const porcelain = err2 ? '' : String(stdout2);
+          resolve({ head, porcelainHash: crypto.createHash('sha256').update(porcelain).digest('hex') });
+        }
+      );
+    });
+  });
+}
+
+// Bounded by a fixed ceiling during recovery — the configurable maxAttemptMs
+// knob is introduced by step 6; this uses a generous fixed default so a
+// green_test verification here can never hang a boot/run-start indefinitely.
+const RECOVERY_GREEN_TEST_TIMEOUT_MS = 300000;
+function runGreenTestForRecovery(command, cwd) {
+  return new Promise((resolve) => {
+    execFile(
+      command,
+      { cwd, shell: true, timeout: RECOVERY_GREEN_TEST_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        resolve({ ok: !err, tail: String(stderr || stdout || '').slice(-2000) });
+      }
+    );
+  });
+}
+
+async function recoverInterruptedTasks(cwd) {
+  const state = loadTaskState();
+  const inProgressIds = Object.keys(state).filter((id) => state[id].status === 'in_progress');
+  if (!inProgressIds.length) return;
+
+  const tasks = readJson(FILES.tasks, []);
+  const byId = new Map(tasks.map((t) => [t.id, t]));
+  const gitState = await currentGitState(cwd);
+
+  for (const id of inProgressIds) {
+    const record = state[id];
+    const task = byId.get(id);
+    const depsDone = !task || (task.depends_on || []).every((d) => state[d] && state[d].status === 'done');
+    const { result, reason } = classifyInterrupted({ ...record, greenTest: task && task.green_test }, gitState, depsDone);
+
+    if (result === 'done') {
+      markTaskCompleted(id);
+      console.log(`[recovery] ${id}: ${reason} -> done`);
+      continue;
+    }
+
+    if (result === 'verify' && task && task.green_test) {
+      const outcome = await runGreenTestForRecovery(task.green_test, cwd);
+      if (outcome.ok) {
+        markTaskCompleted(id);
+        console.log(`[recovery] ${id}: repo changed, green_test passed -> done`);
+      } else {
+        setTaskState(FILES.taskState, id, { status: 'pending', current: null }, { completedFile: FILES.completed, abortedFile: FILES.aborted });
+        const idx = tasks.findIndex((t) => t.id === id);
+        if (idx !== -1) {
+          tasks[idx].suggested_fix = `Recovered from an interrupted run: repo had partial changes but green_test failed:\n${outcome.tail}`;
+          writeTasks(tasks);
+        }
+        console.log(`[recovery] ${id}: repo changed, green_test failed -> pending with suggested_fix`);
+      }
+      continue;
+    }
+
+    if (result === 'needs_verification') {
+      const changedFiles = await gitChangedFiles(cwd);
+      let logTail = '';
+      try {
+        logTail = fs.readFileSync(path.join(LOGS_DIR, `${id}.log`), 'utf8').slice(-2000);
+      } catch {
+        /* no log from this attempt */
+      }
+      setTaskState(FILES.taskState, id, { status: 'pending', current: null }, { completedFile: FILES.completed, abortedFile: FILES.aborted });
+      const idx = tasks.findIndex((t) => t.id === id);
+      if (idx !== -1) {
+        tasks[idx].suggested_fix = [
+          'Recovered from an interrupted run — the repo already shows changes from a prior attempt (no green_test to verify automatically). Continue the work rather than starting over.',
+          changedFiles.length ? `Changed files: ${changedFiles.join(', ')}` : '',
+          logTail ? `Last log output:\n${logTail}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n');
+        writeTasks(tasks);
+      }
+      console.log(`[recovery] ${id}: repo changed, no green_test -> requeued with continuation context`);
+      continue;
+    }
+
+    // 'pending' — no evidence of progress, or a dependency isn't done yet.
+    // Just clear the in-flight marker so the scheduler picks it up normally.
+    setTaskState(FILES.taskState, id, { status: 'pending', current: null }, { completedFile: FILES.completed, abortedFile: FILES.aborted });
+    console.log(`[recovery] ${id}: ${reason} -> pending`);
+  }
+}
+
 // Adds ".orchestrator/" to the target repo's .gitignore, once, the first time
 // a targetDir is set. Idempotent: no-ops if already present. Best-effort —
 // a non-git target dir or a permissions error must not block anything else.
@@ -2085,9 +2198,10 @@ async function runLoop({ skipEndOfRunExtras = false } = {}) {
     return;
   }
 
-  // Feature 2: clear any stale "running" entries left by a previously crashed or
-  // force-closed run before we start fresh.
-  clearRunning();
+  // Step 5: evidence-based recovery of any task still marked "in_progress"
+  // from a previously crashed or force-closed run, instead of the old blind
+  // wipe — see recoverInterruptedTasks / classifyInterrupted.
+  await recoverInterruptedTasks(cwd);
 
   // Preflight: catch "claude CLI not logged in / not installed" ONCE, up front,
   // instead of aborting every queued task with the same stderr one by one.
@@ -2644,15 +2758,16 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  // runningControllers is in-memory, so by definition nothing is in flight on a
-  // fresh boot. Anything left in running.json is stale from a backend that was
-  // killed or crashed mid-run; keeping it would show phantom "Running" rows
-  // that survive restarts until the next full run happens to clear them.
+server.listen(PORT, async () => {
+  // runningControllers is in-memory, so by definition nothing is in flight on
+  // a fresh boot. Step 5: anything still "in_progress" from a backend that
+  // was killed or crashed mid-run is recovered with evidence (git state +
+  // dependency completion), not blindly wiped — see recoverInterruptedTasks.
   const stale = readRunning().map((r) => r.taskId);
   if (stale.length) {
-    clearRunning();
-    console.log(`Cleared ${stale.length} stale running entr(ies): ${stale.join(', ')}`);
+    const cwd = getConfig().targetDir || process.cwd();
+    await recoverInterruptedTasks(cwd);
+    console.log(`Recovered ${stale.length} interrupted task(s) from a previous run: ${stale.join(', ')}`);
   }
   console.log(`claude-orchestrator backend listening on http://localhost:${PORT}`);
   console.log(`Using claude binary: ${CLAUDE_BIN}`);

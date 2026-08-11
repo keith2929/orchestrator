@@ -11,6 +11,7 @@ import {
   completedIds,
   abortedIds,
   runningEntries,
+  classifyInterrupted,
 } from '../core/taskState.js';
 
 function tmpFile() {
@@ -81,4 +82,59 @@ test('attempt counters increment once per attempt', () => {
   state = readTaskState(file);
   assert.equal(state['task-1'].history.length, 2);
   assert.equal(state['task-1'].history[1].attempt, 2);
+});
+
+// --- classifyInterrupted: one case per ladder row ---
+
+test('classifyInterrupted: already done', () => {
+  const out = classifyInterrupted({ status: 'done' }, { head: 'a', porcelainHash: 'x' }, true);
+  assert.equal(out.result, 'done');
+});
+
+test('classifyInterrupted: no change, no output -> pending, attempt not counted', () => {
+  const record = {
+    status: 'in_progress',
+    current: { startedAt: 100, lastOutputAt: 100, gitBaseline: { head: 'a', porcelainHash: 'x' } },
+  };
+  const out = classifyInterrupted(record, { head: 'a', porcelainHash: 'x' }, true);
+  assert.equal(out.result, 'pending');
+  assert.equal(out.countsTowardAttempts, false);
+});
+
+test('classifyInterrupted: repo changed + green_test -> verify', () => {
+  const record = {
+    status: 'in_progress',
+    greenTest: 'npm test',
+    current: { startedAt: 100, lastOutputAt: 100, gitBaseline: { head: 'a', porcelainHash: 'x' } },
+  };
+  const out = classifyInterrupted(record, { head: 'b', porcelainHash: 'y' }, true);
+  assert.equal(out.result, 'verify');
+});
+
+test('classifyInterrupted: repo changed, no green_test -> needs_verification', () => {
+  const record = {
+    status: 'in_progress',
+    current: { startedAt: 100, lastOutputAt: 100, gitBaseline: { head: 'a', porcelainHash: 'x' } },
+  };
+  const out = classifyInterrupted(record, { head: 'b', porcelainHash: 'y' }, true);
+  assert.equal(out.result, 'needs_verification');
+});
+
+test('classifyInterrupted: dependency not done -> pending', () => {
+  const record = {
+    status: 'in_progress',
+    current: { startedAt: 100, lastOutputAt: 100, gitBaseline: { head: 'a', porcelainHash: 'x' } },
+  };
+  const out = classifyInterrupted(record, { head: 'a', porcelainHash: 'x' }, false);
+  assert.equal(out.result, 'pending');
+  assert.equal(out.countsTowardAttempts, false);
+});
+
+test('classifyInterrupted: output captured but no repo change -> pending', () => {
+  const record = {
+    status: 'in_progress',
+    current: { startedAt: 100, lastOutputAt: 500, gitBaseline: { head: 'a', porcelainHash: 'x' } },
+  };
+  const out = classifyInterrupted(record, { head: 'a', porcelainHash: 'x' }, true);
+  assert.equal(out.result, 'pending');
 });

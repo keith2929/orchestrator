@@ -120,3 +120,44 @@ export function runningEntries(state) {
     .filter((id) => state[id].status === 'in_progress')
     .map((id) => ({ taskId: id, startTime: (state[id].current && state[id].current.startedAt) || Date.now() }));
 }
+
+// Step 5 — crash recovery. Pure: takes evidence as arguments (a task_state.json
+// record — optionally carrying a `greenTest` field the caller copies over from
+// tasks.json — the CURRENT git state, and whether every dependency is done)
+// and returns which branch of the recovery ladder applies. It never reads
+// files or runs git itself, so it is unit-testable without a filesystem.
+//
+// Ladder (see HARDENING_PLAN.md step 5):
+//   1. id already done                                -> 'done'
+//   2. repo unchanged vs gitBaseline AND no output     -> 'pending' (attempt not counted)
+//   3. repo changed AND task has a green_test          -> 'verify'
+//   4. repo changed, no green_test                     -> 'needs_verification'
+//   5. a dependency is not done                        -> 'pending'
+export function classifyInterrupted(record, gitState, depsDone) {
+  if (!record || record.status === 'done') {
+    return { result: 'done', reason: 'already marked done' };
+  }
+  if (depsDone === false) {
+    return { result: 'pending', reason: 'a dependency is not done yet', countsTowardAttempts: false };
+  }
+
+  const current = record.current || {};
+  const baseline = current.gitBaseline;
+  const repoChanged = !!(baseline && gitState) && (baseline.head !== gitState.head || baseline.porcelainHash !== gitState.porcelainHash);
+  const hasOutput =
+    typeof current.lastOutputAt === 'number' && typeof current.startedAt === 'number' && current.lastOutputAt > current.startedAt;
+
+  if (!repoChanged && !hasOutput) {
+    return { result: 'pending', reason: 'repo unchanged and no captured output', countsTowardAttempts: false };
+  }
+  if (repoChanged && record.greenTest) {
+    return { result: 'verify', reason: 'repo changed and a green_test is defined — verify before deciding' };
+  }
+  if (repoChanged) {
+    return { result: 'needs_verification', reason: 'repo changed but no green_test — requeue so the worker continues rather than restarts' };
+  }
+  // Output was captured but the repo shows no net change (e.g. a read-only
+  // investigation task, or edits that were later reverted) — not enough
+  // evidence to call it done, so treat like "no progress".
+  return { result: 'pending', reason: 'output captured but no repo change detected', countsTowardAttempts: false };
+}
