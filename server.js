@@ -29,6 +29,8 @@ import { listModels } from './clients/index.js';
 import { getRolesConfig, getClientsConfig, CONTEXT_DIR, detectRateLimit, parseRetryAfterMs } from './shared.js';
 import { execute } from './execution/index.js';
 import { checkClaudeAuth } from './execution/native.js';
+import { createToolRunner } from './agent/toolRunner.js';
+import { toolList } from './agent/tools/index.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
@@ -376,6 +378,18 @@ function workerModelMenu() {
   return { refs, menu, fallback: refs[0] || 'claude:sonnet' };
 }
 
+// Phase 6: the tools the splitter may fold a mechanical tail into. Excludes
+// task_complete — that's an agent-loop-internal completion signal, not a
+// standalone deterministic step. Names are validated against this same list
+// (roles/shared.js normalizeToolNode) so a hallucinated tool name is rejected
+// rather than silently persisted into a node the scheduler can't run.
+function toolMenu() {
+  const eligible = toolList.filter((t) => t.name !== 'task_complete');
+  const names = eligible.map((t) => t.name);
+  const menu = eligible.map((t) => `  "${t.name}" — ${t.description}`).join('\n');
+  return { names, menu };
+}
+
 // ---------------------------------------------------------------------------
 // Route: POST /api/plan
 // ---------------------------------------------------------------------------
@@ -432,6 +446,7 @@ async function handleSplit(req, res) {
   }
 
   const { menu, fallback } = workerModelMenu();
+  const { names: toolNames, menu: toolMenuText } = toolMenu();
 
   let expanded;
   try {
@@ -440,6 +455,8 @@ async function handleSplit(req, res) {
       menu,
       fallback,
       lessons: lessonsBlock(),
+      toolMenu: toolMenuText,
+      toolNames,
       cwd: getConfig().targetDir || process.cwd(),
     });
   } catch (e) {
@@ -751,7 +768,7 @@ async function handlePutTask(req, res, id) {
   const idx = tasks.findIndex((t) => t.id === id);
   if (idx === -1) return sendJson(res, 404, { error: `No task with id "${id}".` });
 
-  const allowed = ['description', 'assigned_model', 'effort', 'depends_on'];
+  const allowed = ['description', 'assigned_model', 'effort', 'depends_on', 'type', 'tool', 'args', 'onFailure'];
   for (const key of allowed) {
     if (key in patch) tasks[idx][key] = patch[key];
   }
@@ -791,7 +808,11 @@ async function handleRetryTask(res, id) {
     /* no error log — fall through to the plain un-abort */
   }
 
-  if (errorLog.trim()) {
+  // Tool nodes have no prompt for a suggested_fix to feed into — a shell
+  // command either works or it doesn't, and the retry re-runs it verbatim
+  // (e.g. a transient `npm install` network blip). Skip the healer LLM call
+  // entirely rather than produce advice nothing will ever read.
+  if (errorLog.trim() && tasks[idx].type !== 'tool') {
     try {
       const heal = await runRole('healer', { taskId: id, description: tasks[idx].description, errorLog });
       suggested_fix = heal.fix_summary || null;
@@ -848,13 +869,17 @@ async function handleRunOne(res, id) {
   const cfg = getConfig();
   const cwd = cfg.targetDir || process.cwd();
 
-  sse(res, { type: 'status', message: '🔐 Checking claude CLI login…' });
-  const auth = await checkClaudeAuth();
-  if (!auth.ok) {
-    sse(res, { type: 'error', message: `⛔ ${auth.message}` });
-    sse(res, { type: 'done', message: `⛔ Run stopped before starting — ${auth.message}` });
-    if (!clientGone) res.end();
-    return;
+  // Tool nodes never touch a provider — skip the claude-CLI login preflight
+  // entirely rather than block a zero-LLM step on an unrelated login check.
+  if (task.type !== 'tool') {
+    sse(res, { type: 'status', message: '🔐 Checking claude CLI login…' });
+    const auth = await checkClaudeAuth();
+    if (!auth.ok) {
+      sse(res, { type: 'error', message: `⛔ ${auth.message}` });
+      sse(res, { type: 'done', message: `⛔ Run stopped before starting — ${auth.message}` });
+      if (!clientGone) res.end();
+      return;
+    }
   }
 
   // Starting a task manually clears any prior aborted mark, same as retry.
@@ -863,10 +888,14 @@ async function handleRunOne(res, id) {
   sse(res, {
     type: 'task-start',
     id: task.id,
-    message: `▶️ ${task.id} — ${task.description} [${task.assigned_model}/${task.effort}]`,
+    message:
+      task.type === 'tool'
+        ? `🔧 ${task.id} — ${task.description} [tool:${task.tool}]`
+        : `▶️ ${task.id} — ${task.description} [${task.assigned_model}/${task.effort}]`,
   });
 
-  const { ok, rateLimited } = await runTask(task, cwd, (payload) => sse(res, payload));
+  const runFn = task.type === 'tool' ? runToolNode : runTask;
+  const { ok, rateLimited } = await runFn(task, cwd, (payload) => sse(res, payload));
   if (clientGone) return;
 
   // A provider limit isn't this task's fault — leave it PENDING rather than
@@ -1146,7 +1175,13 @@ const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 // "analyzer" has no dedicated role by default → resolveRole falls back to the
 // planner model (this was the cheap `fable` pass before the refactor).
 async function analyzeFiles(tasks, cwd) {
-  const need = tasks.filter((t) => !Array.isArray(t.files));
+  // Phase 6: tool nodes never go through the LLM guesser — normalizeToolNode
+  // already derived a static files[] where the tool's args make that possible
+  // (write_file/append_file/mkdir); everything else intentionally runs solo
+  // (see the "unknownFiles" handling in the scheduler). Either way, asking
+  // the analyzer to guess a shell command's file footprint would be a
+  // pointless LLM call for a node designed to cost zero.
+  const need = tasks.filter((t) => t.type !== 'tool' && !Array.isArray(t.files));
   if (need.length === 0) return tasks;
 
   let ann;
@@ -1347,6 +1382,94 @@ function runTask(task, cwd, emit) {
         flush();
         finish(false, e.message);
       });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6: mechanical type:"tool" nodes. Zero LLM involvement — runs the
+// named tool directly via createToolRunner instead of building a worker
+// prompt, but shares the same running.json/log-file/error-log/abort-
+// controller plumbing as runTask so the rest of the scheduler and the UI
+// don't need to know the difference. A failure writes error_logs/{id}.txt
+// from the tool's own result — self-healing/lesson capture is triggered by
+// the exit code, not an LLM's self-report.
+// ---------------------------------------------------------------------------
+function runToolNode(node, cwd, emit) {
+  return new Promise((resolve) => {
+    addRunning(node.id);
+    const controller = new AbortController();
+    runningControllers.set(node.id, controller);
+
+    const logPath = path.join(LOGS_DIR, `${node.id}.log`);
+    let logStream = null;
+    try {
+      logStream = fs.createWriteStream(logPath, { flags: 'w' });
+    } catch {
+      /* best-effort: streaming still works without the on-disk log */
+    }
+
+    let outAll = '';
+    const OUT_CAP = 16000;
+    const onLog = (line) => {
+      if (logStream) {
+        try {
+          logStream.write(line);
+        } catch {
+          /* ignore log write errors */
+        }
+      }
+      outAll = (outAll + line).slice(-OUT_CAP);
+      emit({ type: 'log', log: `[${node.id}] ${line}` });
+    };
+
+    (async () => {
+      let result;
+      if (node.recipe) {
+        // Schema accepted ahead of the registry that will interpret it —
+        // see REDESIGN_PLAN.md Phase 7. Fails loud rather than silently
+        // no-op-ing a node the plan expects to have run.
+        result = { ok: false, error: `Recipe nodes are not runnable yet (Phase 7): "${node.recipe}"` };
+      } else {
+        const runner = createToolRunner({ cwd, limits: {}, onLog });
+        try {
+          result = await runner.run(node.tool, node.args || {});
+        } catch (e) {
+          result = { ok: false, error: e.message };
+        }
+      }
+
+      removeRunning(node.id);
+      runningControllers.delete(node.id);
+      if (logStream) {
+        try {
+          logStream.end();
+        } catch {
+          /* ignore */
+        }
+      }
+
+      if (!result.ok) {
+        // result.error covers most tools (bad args, path escape, unknown
+        // tool); run_bash instead reports stdout/stderr/exitCode with no
+        // `error` field — without pulling those in, the error log would hold
+        // only the toolRunner's one-line summary, not the command's actual
+        // output, which is exactly what self-healing/lesson capture needs.
+        const parts = [];
+        if (result.error) parts.push(String(result.error));
+        if (typeof result.exitCode === 'number') parts.push(`exit code: ${result.exitCode}`);
+        if (result.stderr) parts.push(`--- stderr ---\n${result.stderr}`);
+        if (result.stdout) parts.push(`--- stdout ---\n${result.stdout}`);
+        const errText = parts.join('\n\n').trim() || outAll.trim();
+        try {
+          fs.writeFileSync(path.join(ERROR_LOGS_DIR, `${node.id}.txt`), errText || '(no output captured)');
+        } catch {
+          /* best-effort */
+        }
+      }
+      // Tool nodes never touch a provider, so a rate-limit pause never
+      // applies to them.
+      resolve({ ok: !!result.ok, rateLimited: null });
+    })();
   });
 }
 
@@ -1656,11 +1779,14 @@ async function runLoop() {
       broadcast({
         type: 'task-start',
         id: t.id,
-        message: `▶️ ${t.id} — ${t.description} [${t.assigned_model}/${t.effort}]`,
+        message:
+          t.type === 'tool'
+            ? `🔧 ${t.id} — ${t.description} [tool:${t.tool}]`
+            : `▶️ ${t.id} — ${t.description} [${t.assigned_model}/${t.effort}]`,
       });
       inFlight.set(
         t.id,
-        runTask(t, cwd, broadcast).then((r) => ({ id: t.id, task: t, ...r }))
+        (t.type === 'tool' ? runToolNode : runTask)(t, cwd, broadcast).then((r) => ({ id: t.id, task: t, ...r }))
       );
       launched = true;
 

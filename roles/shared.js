@@ -74,3 +74,39 @@ export function normalizeTask(t, i, fallbackModel) {
   if (t.green_test) norm.green_test = String(t.green_test);
   return norm;
 }
+
+// Phase 6: tools whose target path is a known arg at plan time, so the
+// scheduler can statically derive the node's file footprint instead of
+// asking the (LLM) file-isolation analyzer to guess it — see analyzeFiles in
+// server.js, which now skips type:"tool" nodes entirely.
+const STATIC_FILE_TOOLS = new Set(['write_file', 'append_file', 'mkdir']);
+
+const ALLOWED_ON_FAILURE = new Set(['spawn-task', 'gate', 'abort']);
+
+// Canonical type:"tool" node normalizer. Mechanical steps (install/build/
+// test/lint/git) execute with zero LLM involvement — the splitter is the
+// only role that currently emits these. `onFailure` is accepted here for
+// forward compatibility with Phase 7's recipes but not yet interpreted; a
+// failing tool node is handled exactly like a failing task today (see
+// runToolNode in server.js).
+export function normalizeToolNode(t, i, toolNames) {
+  const id = t.id || `task-${i + 1}`;
+  const tool = String(t.tool || '').trim();
+  if (!toolNames.includes(tool)) {
+    throw new Error(
+      `Tool node "${id}" references unknown tool "${tool}". Available: ${toolNames.join(', ')}`
+    );
+  }
+  const args = t.args && typeof t.args === 'object' && !Array.isArray(t.args) ? t.args : {};
+  const node = {
+    id,
+    type: 'tool',
+    description: t.description || `${tool}(${JSON.stringify(args)})`,
+    depends_on: Array.isArray(t.depends_on) ? t.depends_on : [],
+    tool,
+    args,
+  };
+  if (ALLOWED_ON_FAILURE.has(t.onFailure)) node.onFailure = t.onFailure;
+  if (STATIC_FILE_TOOLS.has(tool) && typeof args.path === 'string') node.files = [args.path];
+  return node;
+}

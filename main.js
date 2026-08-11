@@ -352,20 +352,27 @@ function renderTable() {
         : done
         ? ''
         : `<button class="tiny start" data-action="run-task">▶️ Start</button>`;
+      // Phase 6: a tool node has no model/effort to assign — it runs a fixed
+      // tool+args with zero LLM involvement — so those columns collapse into
+      // one "tool node" label instead of the editable dropdowns.
+      const modelCell =
+        t.type === 'tool'
+          ? `<span class="badge tool-node" title="${escapeHtml(JSON.stringify(t.args || {}))}">🔧 ${escapeHtml(t.tool)}</span>`
+          : `<select data-field="assigned_model" ${locked ? 'disabled' : ''}>
+              ${modelOptionsHtml(t.assigned_model)}
+            </select>`;
+      const effortCell =
+        t.type === 'tool'
+          ? '<span class="muted">—</span>'
+          : `<select data-field="effort" ${locked ? 'disabled' : ''}>
+              ${optionsHtml(EFFORTS, t.effort)}
+            </select>`;
       return `
         <tr class="${status}" data-id="${t.id}">
           <td>${t.id}</td>
           <td class="desc">${escapeHtml(t.description)}</td>
-          <td>
-            <select data-field="assigned_model" ${locked ? 'disabled' : ''}>
-              ${modelOptionsHtml(t.assigned_model)}
-            </select>
-          </td>
-          <td>
-            <select data-field="effort" ${locked ? 'disabled' : ''}>
-              ${optionsHtml(EFFORTS, t.effort)}
-            </select>
-          </td>
+          <td>${modelCell}</td>
+          <td>${effortCell}</td>
           <td>${statusCell}</td>
           <td>${actionCell}</td>
           <td><button class="tiny" data-action="log">📄 Log</button></td>
