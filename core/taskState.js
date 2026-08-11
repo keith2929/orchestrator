@@ -121,6 +121,41 @@ export function runningEntries(state) {
     .map((id) => ({ taskId: id, startTime: (state[id].current && state[id].current.startedAt) || Date.now() }));
 }
 
+// Step 6 — stall / hard-ceiling detection (invariant 3). Pure: given a
+// record's `current` evidence and the configured knobs, decides whether the
+// attempt should be aborted. `now` is passed in rather than read from
+// Date.now() so this is deterministic to test.
+export function isStalled(record, now, limits = {}) {
+  const { stallMs = 600000, maxAttemptMs = 2700000 } = limits;
+  const current = record && record.current;
+  if (!current) return { stalled: false };
+  if (now - current.startedAt >= maxAttemptMs) {
+    return { stalled: true, reason: `maxAttemptMs (${maxAttemptMs}ms) exceeded` };
+  }
+  const lastActivity = Math.max(current.lastOutputAt || current.startedAt, current.lastRepoChangeAt || current.startedAt);
+  if (now - lastActivity >= stallMs) {
+    return { stalled: true, reason: `stallMs (${stallMs}ms) exceeded — no output or repo change` };
+  }
+  return { stalled: false };
+}
+
+// Step 6 — repetition guard (invariant 4). true once `attempts` has reached
+// `maxAttempts`, or once the last `identicalFailureLimit` history entries all
+// share the same failure signature (a worker failing identically rather than
+// making progress). A missing/empty signature never counts as a match.
+export function shouldBlock(record, limits = {}) {
+  const { maxAttempts = 3, identicalFailureLimit = 2 } = limits;
+  if (!record) return false;
+  if (record.attempts >= maxAttempts) return true;
+  const history = record.history || [];
+  if (history.length >= identicalFailureLimit) {
+    const tail = history.slice(-identicalFailureLimit);
+    const sig = tail[0].signature;
+    if (sig && tail.every((h) => h.signature === sig)) return true;
+  }
+  return false;
+}
+
 // Step 5 — crash recovery. Pure: takes evidence as arguments (a task_state.json
 // record — optionally carrying a `greenTest` field the caller copies over from
 // tasks.json — the CURRENT git state, and whether every dependency is done)

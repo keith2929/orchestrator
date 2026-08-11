@@ -17,7 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readJson, writeJson, readJsonFile } from './core/jsonStore.js';
 import { topoSortTasks, uniqueFixId, isPlanComplete, issueSignature } from './core/taskGraph.js';
-import { readTaskState, setTaskState, runningEntries, classifyInterrupted } from './core/taskState.js';
+import { readTaskState, setTaskState, runningEntries, classifyInterrupted, endAttempt, isStalled, shouldBlock } from './core/taskState.js';
 import crypto from 'node:crypto';
 import { extractKeywords, lessonTopicKey, rankLessons } from './core/lessons.js';
 
@@ -116,6 +116,24 @@ const FILES = new Proxy(
 // exactly, since the unified scheduler's depsMet check is what used to be
 // concurrent-mode-only logic (see REDESIGN_PLAN.md Phase 2).
 const DEFAULT_MAX_CONCURRENCY = 3;
+
+// Step 6: worker timeout, stall and repetition guard knobs. All optional in
+// config.json — deliberately generous defaults so a legitimate long build
+// doesn't die, while a hung worker no longer holds its concurrency slot (or
+// burns a session retrying the same failure) forever.
+const DEFAULT_STALL_MS = 600000; // 10 min — no output AND no repo change
+const DEFAULT_MAX_ATTEMPT_MS = 2700000; // 45 min — hard ceiling on one attempt
+const DEFAULT_MAX_ATTEMPTS = 3; // then blocked, not another retry
+const DEFAULT_IDENTICAL_FAILURE_LIMIT = 2; // same failure signature twice -> stop retrying identically
+function readWorkerLimits() {
+  const cfg = getConfig();
+  return {
+    stallMs: Number(cfg.stallMs) || DEFAULT_STALL_MS,
+    maxAttemptMs: Number(cfg.maxAttemptMs) || DEFAULT_MAX_ATTEMPT_MS,
+    maxAttempts: Number(cfg.maxAttempts) || DEFAULT_MAX_ATTEMPTS,
+    identicalFailureLimit: Number(cfg.identicalFailureLimit) || DEFAULT_IDENTICAL_FAILURE_LIMIT,
+  };
+}
 
 // Per-task artefacts. error_logs/{id}.txt drives self-healing retry (Feature 3)
 // and lesson capture (Feature 6); logs/{id}.log is the full tee'd run log
@@ -1720,6 +1738,16 @@ function runTask(task, cwd, emit) {
     const controller = new AbortController();
     runningControllers.set(task.id, controller);
 
+    // Step 6: hard ceiling on one attempt — a hung subprocess must not hold
+    // its concurrency slot forever. Aborts the SAME controller a manual stop
+    // uses; `timedOut` lets finish() report a distinct reason.
+    const limits = readWorkerLimits();
+    let timedOut = false;
+    const attemptTimer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, limits.maxAttemptMs);
+
     // Feature 5: tee everything to logs/{id}.log. Truncated each run so the log
     // reflects the latest attempt rather than accumulating across retries.
     const logPath = path.join(LOGS_DIR, `${task.id}.log`);
@@ -1777,6 +1805,11 @@ function runTask(task, cwd, emit) {
     const finish = (ok, failDetail) => {
       if (settled) return;
       settled = true;
+      clearTimeout(attemptTimer);
+      if (timedOut) {
+        ok = false;
+        failDetail = `timed out after ${limits.maxAttemptMs}ms`;
+      }
       removeRunning(task.id); // Feature 2
       runningControllers.delete(task.id);
       if (logStream) {
@@ -2256,6 +2289,17 @@ async function runLoop({ skipEndOfRunExtras = false } = {}) {
     abortedSet.add(id);
     markTaskAborted(id);
   };
+  // Step 6: a task that hit maxAttempts or failed identically
+  // identicalFailureLimit times in a row is "blocked" rather than aborted —
+  // cascades through dependents exactly like aborted (core/taskState.js's
+  // abortedIds() counts 'blocked' too) but is reported distinctly so a human
+  // can tell "gave up after repeating itself" from "failed once".
+  const markBlocked = (id, reason) => {
+    abortedSet.add(id);
+    setTaskState(FILES.taskState, id, { status: 'blocked' }, { completedFile: FILES.completed, abortedFile: FILES.aborted });
+    broadcast({ type: 'task-aborted', id, message: `🚫 ${id} blocked — ${reason}` });
+  };
+  const workerLimits = readWorkerLimits();
 
   // Set when a provider rate/usage limit is hit. Stops NEW launches; tasks
   // already in flight are drained first, then the run ends with everything
@@ -2263,6 +2307,32 @@ async function runLoop({ skipEndOfRunExtras = false } = {}) {
   let haltedBy = null;
 
   while (!stopped()) {
+    // Step 6 watchdog: every iteration, check every task actually in flight
+    // in THIS process (runningControllers) for a stall or hard-ceiling
+    // breach and abort it — same controller a manual stop uses. Still-alive
+    // tasks get their lease bumped so a future second agent could tell a
+    // live task from an abandoned one.
+    {
+      const now = Date.now();
+      const liveState = loadTaskState();
+      for (const [id, ctrl] of runningControllers) {
+        const record = liveState[id];
+        if (!record) continue;
+        const { stalled, reason } = isStalled(record, now, workerLimits);
+        if (stalled) {
+          broadcast({ type: 'log', log: `⏱️ [${id}] ${reason} — aborting.\n` });
+          ctrl.abort();
+        } else if (record.current) {
+          setTaskState(
+            FILES.taskState,
+            id,
+            { current: { ...record.current, leaseUntil: now + workerLimits.stallMs } },
+            { completedFile: FILES.completed, abortedFile: FILES.aborted }
+          );
+        }
+      }
+    }
+
     const allTasks = readJson(FILES.tasks, []);
     const completed = new Set(readJson(FILES.completed, []));
     const isDone = (id) => completed.has(id);
@@ -2383,6 +2453,28 @@ async function runLoop({ skipEndOfRunExtras = false } = {}) {
     }
 
     if (!done.ok) {
+      // Step 6 repetition guard: hash this failure the same way the goal
+      // loop hashes an audit issue (issueSignature), record it in
+      // task_state.json's history, and stop retrying identically once
+      // maxAttempts or identicalFailureLimit is hit — a "blocked" task
+      // cascades to dependents exactly like "aborted" but is reported
+      // distinctly.
+      let errText = '';
+      try {
+        errText = fs.readFileSync(path.join(ERROR_LOGS_DIR, `${done.id}.txt`), 'utf8');
+      } catch {
+        /* rate-limited/no-output failures skip the error log — see runTask finish() */
+      }
+      const priorAttempts = ((readTaskState(FILES.taskState) || {})[done.id] || {}).attempts || 0;
+      setTaskState(FILES.taskState, done.id, { attempts: priorAttempts + 1 }, { completedFile: FILES.completed, abortedFile: FILES.aborted });
+      const signature = errText ? issueSignature({ task: done.id, description: errText }) : null;
+      const record = endAttempt(FILES.taskState, done.id, 'pending', { detail: errText.slice(0, 500), signature });
+
+      if (shouldBlock(record, workerLimits)) {
+        markBlocked(done.id, `gave up after ${record.attempts} attempt(s) — see task_state.json history for details.`);
+        continue;
+      }
+
       // Don't halt the whole plan: mark this one aborted and let the scheduler
       // carry on with tasks that don't depend on it (dependents cascade to
       // aborted at the top of the next loop).
