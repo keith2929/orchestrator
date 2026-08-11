@@ -15,6 +15,7 @@ import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { readJson, writeJson, readJsonFile } from './core/jsonStore.js';
 
 // Load .env into process.env FIRST — before any module below captures a snapshot
 // of the environment (e.g. shared.js CHILD_ENV) or reads a key. env.js loads on
@@ -94,14 +95,6 @@ function getStateDir() {
   }
   return dir;
 }
-function readJsonFile(file, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
-  }
-}
-
 const FILES = new Proxy(
   { config: CONFIG_FILE },
   {
@@ -169,19 +162,6 @@ function listContextFiles() {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Small JSON file helpers — always fail soft to sane defaults.
-// ---------------------------------------------------------------------------
-function readJson(file, fallback) {
-  try {
-    return JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch {
-    return fallback;
-  }
-}
-function writeJson(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
 function getConfig() {
   return readJson(FILES.config, { targetDir: process.cwd() });
 }
