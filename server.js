@@ -17,6 +17,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readJson, writeJson, readJsonFile } from './core/jsonStore.js';
 import { topoSortTasks, uniqueFixId, isPlanComplete, issueSignature } from './core/taskGraph.js';
+import { readTaskState, setTaskState, runningEntries } from './core/taskState.js';
 import { extractKeywords, lessonTopicKey, rankLessons } from './core/lessons.js';
 
 // Load .env into process.env FIRST — before any module below captures a snapshot
@@ -81,6 +82,7 @@ const STATE_FILENAMES = {
   pause: 'pause.json', // Phase 4: { reason, resumeAt } while auto-paused on a provider limit
   recipeNotes: 'recipe-notes.json', // Phase 8: { [recipeId]: string[] } — lessons graduated into recipe hints
   customRecipes: 'recipes.json', // Phase 9: human-approved recipes mined from this project's own history
+  taskState: 'task_state.json', // Hardening step 4: durable per-task state (attempts, current owner, history)
 };
 
 // <targetDir>/.orchestrator/ — created on first access. Reads config.json
@@ -295,20 +297,15 @@ function writeTasks(tasks) {
 
 // Shared completed/aborted bookkeeping — was duplicated 3+ times across the
 // old sequential/concurrent branches and handleRunOne (see REDESIGN_PLAN.md
-// Phase 2 duplication inventory).
+// Phase 2 duplication inventory). Both are now thin wrappers over
+// core/taskState.js's setTaskState, the single writer of task_state.json,
+// which re-derives completed.json/aborted.json in the same call so every
+// existing reader keeps working unchanged.
 function markTaskAborted(id) {
-  const arr = readJson(FILES.aborted, []);
-  if (!arr.includes(id)) {
-    arr.push(id);
-    writeJson(FILES.aborted, arr);
-  }
+  setTaskState(FILES.taskState, id, { status: 'aborted', current: null }, { completedFile: FILES.completed, abortedFile: FILES.aborted });
 }
 function markTaskCompleted(id) {
-  const arr = readJson(FILES.completed, []);
-  if (!arr.includes(id)) {
-    arr.push(id);
-    writeJson(FILES.completed, arr);
-  }
+  setTaskState(FILES.taskState, id, { status: 'done', current: null }, { completedFile: FILES.completed, abortedFile: FILES.aborted });
 }
 
 // Phase 10: a plan is COMPLETE when every node has reached a terminal state
@@ -327,27 +324,44 @@ function markTaskCompleted(id) {
 // survives a page refresh. Stale entries from a crashed run are cleared when a
 // fresh run starts (see handleRun).
 // ---------------------------------------------------------------------------
+// Migration: if task_state.json doesn't exist yet, synthesize one from the
+// legacy completed.json/aborted.json arrays so upgrading mid-run doesn't
+// forget what already finished.
+function loadTaskState() {
+  return readTaskState(FILES.taskState, { completed: readJson(FILES.completed, []), aborted: readJson(FILES.aborted, []) });
+}
+
+// readRunning() is now a projection over task_state.json's 'in_progress'
+// records — running.json is no longer written. addRunning/removeRunning keep
+// their names (existing call sites are unchanged) but now delegate to
+// setTaskState.
 function readRunning() {
-  const data = readJson(FILES.running, []);
-  if (Array.isArray(data)) return data;
-  // Back-compat: tolerate a single { taskId, startTime } object.
-  return data && data.taskId ? [data] : [];
+  return runningEntries(loadTaskState());
 }
 function addRunning(taskId) {
-  const arr = readRunning().filter((r) => r.taskId !== taskId);
-  arr.push({ taskId, startTime: Date.now() });
-  writeJson(FILES.running, arr);
+  const now = Date.now();
+  setTaskState(
+    FILES.taskState,
+    taskId,
+    {
+      status: 'in_progress',
+      current: { owner: null, leaseUntil: now + 3600000, startedAt: now, lastOutputAt: now, lastRepoChangeAt: now, gitBaseline: null },
+    },
+    { completedFile: FILES.completed, abortedFile: FILES.aborted }
+  );
 }
 function removeRunning(taskId) {
-  const arr = readRunning().filter((r) => r.taskId !== taskId);
-  if (arr.length) writeJson(FILES.running, arr);
-  else clearRunning();
+  setTaskState(FILES.taskState, taskId, { status: 'pending', current: null }, { completedFile: FILES.completed, abortedFile: FILES.aborted });
 }
+// Resets every currently in_progress record to 'pending' — the fresh-run-start
+// / boot-time equivalent of the old "delete running.json". Attempts/history
+// are preserved; only the "is this actively running" flag is cleared.
 function clearRunning() {
-  try {
-    fs.unlinkSync(FILES.running);
-  } catch {
-    /* already gone */
+  const state = loadTaskState();
+  for (const id of Object.keys(state)) {
+    if (state[id].status === 'in_progress') {
+      setTaskState(FILES.taskState, id, { status: 'pending', current: null }, { completedFile: FILES.completed, abortedFile: FILES.aborted });
+    }
   }
 }
 
