@@ -137,14 +137,53 @@ function readWorkerLimits() {
 
 // Per-task artefacts. error_logs/{id}.txt drives self-healing retry (Feature 3)
 // and lesson capture (Feature 6); logs/{id}.log is the full tee'd run log
-// (Feature 5). Created up-front so writes never race a missing directory.
-const ERROR_LOGS_DIR = path.join(__dirname, 'error_logs');
-const LOGS_DIR = path.join(__dirname, 'logs');
-for (const dir of [ERROR_LOGS_DIR, LOGS_DIR]) {
+// (Feature 5).
+//
+// Step 8: these used to live next to this script, keyed by bare task id —
+// and every plan reuses ids like "task-3", so a new project could read a
+// stale error log (or mined recipe) from a completely different project that
+// last used the tool. Both now resolve through getStateDir() like every
+// other piece of state, lazily per CURRENT targetDir rather than once at
+// module load — so switching projects never bleeds logs between them.
+// './logs' and './error_logs' next to this script are dead and deletable.
+function errorLogsDir() {
+  const dir = path.join(getStateDir(), 'error_logs');
   try {
     fs.mkdirSync(dir, { recursive: true });
   } catch {
     /* best-effort: creation errors surface later on read/write */
+  }
+  return dir;
+}
+function logsDir() {
+  const dir = path.join(getStateDir(), 'logs');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    /* best-effort: creation errors surface later on read/write */
+  }
+  return dir;
+}
+
+// Keeps only the newest `keep` .log/.txt files in `dir` — an unattended run
+// over many plans must not accumulate artefacts forever. Best-effort: a
+// failure here must never block the caller's own read/write.
+const MAX_LOGS_PER_PROJECT = 50;
+function pruneOldLogs(dir, keep = MAX_LOGS_PER_PROJECT) {
+  try {
+    const files = fs
+      .readdirSync(dir)
+      .map((f) => ({ f, mtime: fs.statSync(path.join(dir, f)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const { f } of files.slice(keep)) {
+      try {
+        fs.unlinkSync(path.join(dir, f));
+      } catch {
+        /* best-effort */
+      }
+    }
+  } catch {
+    /* directory may not exist yet — nothing to prune */
   }
 }
 
@@ -975,7 +1014,7 @@ async function handleAudit(res) {
 // recipe. Never auto-promoted — see handleApproveRecipe.
 // ---------------------------------------------------------------------------
 async function mineAndCurateRecipes(cwd) {
-  const clusters = mineCandidates({ tasksPath: FILES.tasks, memoryPath: FILES.memory, logsDir: LOGS_DIR });
+  const clusters = mineCandidates({ tasksPath: FILES.tasks, memoryPath: FILES.memory, logsDir: logsDir() });
   const profile = detectProjectProfile(cwd);
   const { menu: toolMenuText, names: toolNames } = toolMenu();
 
@@ -1125,7 +1164,7 @@ async function handleRetryTask(res, id) {
   }
 
   let suggested_fix = null;
-  const logPath = path.join(ERROR_LOGS_DIR, `${id}.txt`);
+  const logPath = path.join(errorLogsDir(), `${id}.txt`);
   let errorLog = '';
   try {
     errorLog = fs.readFileSync(logPath, 'utf8');
@@ -1366,8 +1405,8 @@ function handleDeleteContext(res, rawName) {
 // ---------------------------------------------------------------------------
 // Return the full tee'd run log for a task, or a friendly note if none exists.
 function handleGetLog(res, id) {
-  const safeId = path.basename(String(id)); // never escape LOGS_DIR
-  const logPath = path.join(LOGS_DIR, `${safeId}.log`);
+  const safeId = path.basename(String(id)); // never escape logsDir()
+  const logPath = path.join(logsDir(), `${safeId}.log`);
   let content = '';
   try {
     content = fs.readFileSync(logPath, 'utf8');
@@ -1498,7 +1537,7 @@ async function recoverInterruptedTasks(cwd) {
       const changedFiles = await gitChangedFiles(cwd);
       let logTail = '';
       try {
-        logTail = fs.readFileSync(path.join(LOGS_DIR, `${id}.log`), 'utf8').slice(-2000);
+        logTail = fs.readFileSync(path.join(logsDir(), `${id}.log`), 'utf8').slice(-2000);
       } catch {
         /* no log from this attempt */
       }
@@ -1558,7 +1597,7 @@ async function appendSessionContext(taskId, cwd) {
 // ask the LLM to distill the failure→fix into a lesson and append it to
 // memory.json. The error log is then removed so the lesson isn't re-recorded.
 async function recordLesson(task) {
-  const logPath = path.join(ERROR_LOGS_DIR, `${task.id}.txt`);
+  const logPath = path.join(errorLogsDir(), `${task.id}.txt`);
   let errorLog = '';
   try {
     errorLog = fs.readFileSync(logPath, 'utf8');
@@ -1755,7 +1794,7 @@ function runTask(task, cwd, emit) {
 
     // Feature 5: tee everything to logs/{id}.log. Truncated each run so the log
     // reflects the latest attempt rather than accumulating across retries.
-    const logPath = path.join(LOGS_DIR, `${task.id}.log`);
+    const logPath = path.join(logsDir(), `${task.id}.log`);
     let logStream = null;
     try {
       logStream = fs.createWriteStream(logPath, { flags: 'w' });
@@ -1839,7 +1878,7 @@ function runTask(task, cwd, emit) {
         // we have, so the retry has *something* real to work from.
         const errText = stderrAll.trim() || stdoutAll.trim() || (failDetail || '').trim();
         try {
-          fs.writeFileSync(path.join(ERROR_LOGS_DIR, `${task.id}.txt`), errText || '(no output captured)');
+          fs.writeFileSync(path.join(errorLogsDir(), `${task.id}.txt`), errText || '(no output captured)');
         } catch {
           /* best-effort */
         }
@@ -1891,7 +1930,7 @@ function runToolNode(node, cwd, emit) {
     const controller = new AbortController();
     runningControllers.set(node.id, controller);
 
-    const logPath = path.join(LOGS_DIR, `${node.id}.log`);
+    const logPath = path.join(logsDir(), `${node.id}.log`);
     let logStream = null;
     try {
       logStream = fs.createWriteStream(logPath, { flags: 'w' });
@@ -1952,7 +1991,7 @@ function runToolNode(node, cwd, emit) {
         if (result.stdout) parts.push(`--- stdout ---\n${result.stdout}`);
         const errText = parts.join('\n\n').trim() || outAll.trim();
         try {
-          fs.writeFileSync(path.join(ERROR_LOGS_DIR, `${node.id}.txt`), errText || '(no output captured)');
+          fs.writeFileSync(path.join(errorLogsDir(), `${node.id}.txt`), errText || '(no output captured)');
         } catch {
           /* best-effort */
         }
@@ -1977,7 +2016,7 @@ function spawnFixTask(node, cwd) {
 
   let errorText = '';
   try {
-    errorText = fs.readFileSync(path.join(ERROR_LOGS_DIR, `${node.id}.txt`), 'utf8');
+    errorText = fs.readFileSync(path.join(errorLogsDir(), `${node.id}.txt`), 'utf8');
   } catch {
     /* nothing captured */
   }
@@ -2241,6 +2280,11 @@ async function runLoop({ skipEndOfRunExtras = false } = {}) {
   // wipe — see recoverInterruptedTasks / classifyInterrupted.
   await recoverInterruptedTasks(cwd);
 
+  // Step 8: bound how many per-task artefacts one project accumulates across
+  // an unattended run of many plans.
+  pruneOldLogs(logsDir());
+  pruneOldLogs(errorLogsDir());
+
   // Preflight: catch "claude CLI not logged in / not installed" ONCE, up front,
   // instead of aborting every queued task with the same stderr one by one.
   broadcast({ type: 'status', message: '🔐 Checking claude CLI login…' });
@@ -2466,7 +2510,7 @@ async function runLoop({ skipEndOfRunExtras = false } = {}) {
       // distinctly.
       let errText = '';
       try {
-        errText = fs.readFileSync(path.join(ERROR_LOGS_DIR, `${done.id}.txt`), 'utf8');
+        errText = fs.readFileSync(path.join(errorLogsDir(), `${done.id}.txt`), 'utf8');
       } catch {
         /* rate-limited/no-output failures skip the error log — see runTask finish() */
       }
