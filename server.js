@@ -33,6 +33,7 @@ import { createToolRunner } from './agent/toolRunner.js';
 import { toolList } from './agent/tools/index.js';
 import { getRecipe, recipeList } from './graph/recipes/index.js';
 import { detectProjectProfile } from './graph/projectProfile.js';
+import { mineCandidates, annotateCandidate } from './graph/recipeMiner.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
@@ -74,6 +75,7 @@ const STATE_FILENAMES = {
   plannerChat: 'planner_chat.json', // Durable "chat with the planner" transcript
   pause: 'pause.json', // Phase 4: { reason, resumeAt } while auto-paused on a provider limit
   recipeNotes: 'recipe-notes.json', // Phase 8: { [recipeId]: string[] } — lessons graduated into recipe hints
+  customRecipes: 'recipes.json', // Phase 9: human-approved recipes mined from this project's own history
 };
 
 // <targetDir>/.orchestrator/ — created on first access. Reads config.json
@@ -229,6 +231,55 @@ function topoSortTasks(tasks) {
 // dependencies. Runs on every writeTasks() call, so it doesn't matter
 // whether a recipe node arrived via the API or a hand-edited tasks.json.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Phase 9: project-local custom recipes — human-approved proposals mined
+// from THIS project's own history (see graph/recipeMiner.js + the curator
+// role), stored as pure declarative data at
+// <targetDir>/.orchestrator/recipes.json. Built-in recipes (graph/recipes/)
+// still win on id collision — they ship with the codebase and are reviewed
+// by a human at authoring time, not runtime.
+// ---------------------------------------------------------------------------
+function readCustomRecipes(cwd) {
+  const file = path.join(cwd, '.orchestrator', 'recipes.json');
+  const list = readJson(file, []);
+  return Array.isArray(list) ? list : [];
+}
+function writeCustomRecipes(cwd, list) {
+  const file = path.join(cwd, '.orchestrator', 'recipes.json');
+  writeJson(file, list);
+}
+
+// Mechanically turns a curator-proposed step's args into concrete values by
+// substituting "{{paramName}}" inside string values — NEVER eval, never a
+// model-authored function body. A param with no supplied value leaves its
+// placeholder untouched rather than guessing.
+function substituteParams(value, params) {
+  if (typeof value === 'string') {
+    return value.replace(/\{\{(\w+)\}\}/g, (m, name) => (name in params ? String(params[name]) : m));
+  }
+  if (Array.isArray(value)) return value.map((v) => substituteParams(v, params));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, substituteParams(v, params)]));
+  }
+  return value;
+}
+
+// Built-ins first, then this project's own approved recipes. A custom
+// recipe's `expand` is mechanically constructed here from its stored
+// `steps` — the registry, not the model, turns data into code.
+function getRecipeForProject(id, cwd) {
+  const builtin = getRecipe(id);
+  if (builtin) return builtin;
+  const custom = readCustomRecipes(cwd).find((r) => r.id === id);
+  if (!custom) return null;
+  return {
+    ...custom,
+    expand(params) {
+      return substituteParams(custom.steps, params || {});
+    },
+  };
+}
+
 function expandRecipeNodes(tasks, cwd) {
   if (!tasks.some((t) => t.type === 'recipe')) return tasks;
   const profile = detectProjectProfile(cwd);
@@ -238,7 +289,7 @@ function expandRecipeNodes(tasks, cwd) {
       out.push(t);
       continue;
     }
-    const recipe = getRecipe(t.recipe);
+    const recipe = getRecipeForProject(t.recipe, cwd);
     if (!recipe) {
       throw new Error(`Node "${t.id}" references unknown recipe "${t.recipe}".`);
     }
@@ -268,7 +319,7 @@ function expandRecipeNodes(tasks, cwd) {
       // recipeHintFor (Phase 8) folds in whatever this project has since
       // learned about this recipe's failure modes, on top of its static text.
       if (recipe.exclusive) node.exclusive = true;
-      const hint = recipeHintFor(recipe.id);
+      const hint = recipeHintFor(recipe.id, cwd);
       if (hint) node.onFailureHint = hint;
       if (t.onFailure) node.onFailure = t.onFailure;
       out.push(node);
@@ -458,9 +509,10 @@ function appendRecipeNote(recipeId, note) {
   writeJson(FILES.recipeNotes, notes);
 }
 // The hint actually surfaced on an expanded recipe node: the recipe
-// module's own static text, plus whatever this project has since learned.
-function recipeHintFor(recipeId) {
-  const recipe = getRecipe(recipeId);
+// module's own static text (built-in or custom), plus whatever this project
+// has since learned.
+function recipeHintFor(recipeId, cwd) {
+  const recipe = getRecipeForProject(recipeId, cwd);
   const base = (recipe && recipe.onFailureHint) || '';
   const notes = readRecipeNotes()[recipeId] || [];
   if (!notes.length) return base;
@@ -959,6 +1011,107 @@ async function handleAudit(res) {
       hint: 'Check config.json "roles.auditor" — is its client reachable (claude on PATH, or the provider API key env var set)?',
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9: post-mortem recipe mining. Detection (mineCandidates,
+// annotateCandidate) is pure code, zero LLM; this wraps it with ONE bounded
+// recipeCurator call per candidate that isn't already covered by an existing
+// recipe. Never auto-promoted — see handleApproveRecipe.
+// ---------------------------------------------------------------------------
+async function mineAndCurateRecipes(cwd) {
+  const clusters = mineCandidates({ tasksPath: FILES.tasks, memoryPath: FILES.memory, logsDir: LOGS_DIR });
+  const profile = detectProjectProfile(cwd);
+  const { menu: toolMenuText, names: toolNames } = toolMenu();
+
+  const results = [];
+  for (const cluster of clusters) {
+    const annotated = annotateCandidate(cluster, profile);
+    if (annotated.matchesExistingRecipe) {
+      results.push({
+        ...annotated,
+        proposal: null,
+        note: `Already covered by the "${annotated.matchesExistingRecipe}" recipe — no new recipe needed.`,
+      });
+      continue;
+    }
+    try {
+      const proposal = await runRole('recipeCurator', {
+        examples: annotated.members.map((m) => m.text).slice(0, 5),
+        toolMenu: toolMenuText,
+        toolNames,
+        profile,
+        matchesProfileScripts: annotated.matchesProfileScripts,
+      });
+      results.push({ ...annotated, proposal });
+    } catch (e) {
+      results.push({ ...annotated, proposal: null, error: e.message });
+    }
+  }
+  return results;
+}
+
+async function handleMineRecipes(res) {
+  const cwd = getConfig().targetDir || process.cwd();
+  try {
+    sendJson(res, 200, { candidates: await mineAndCurateRecipes(cwd) });
+  } catch (e) {
+    sendJson(res, 500, { error: 'Recipe mining failed.', detail: e.message });
+  }
+}
+
+// POST /api/recipes/approve — the human-approval gate. Body: { recipe: {
+// id, description, params?, steps, onFailureHint? } } (a proposal from
+// POST /api/recipes/mine, possibly hand-edited first). Landing a recipe is
+// just appending validated data to this project's recipes.json — nothing
+// executable is ever written.
+async function handleApproveRecipe(req, res) {
+  const body = await readBody(req);
+  const proposal = body.recipe;
+  if (!proposal || typeof proposal !== 'object') {
+    return sendJson(res, 400, { error: 'Missing "recipe" in request body.' });
+  }
+  const id = String(proposal.id || '').trim();
+  if (!/^[a-z][a-z0-9-]*$/.test(id)) {
+    return sendJson(res, 400, { error: `Invalid recipe id: ${JSON.stringify(proposal.id)}` });
+  }
+  if (getRecipe(id)) {
+    return sendJson(res, 400, { error: `"${id}" collides with a built-in recipe id — choose another.` });
+  }
+  const { names: toolNames } = toolMenu();
+  const steps = Array.isArray(proposal.steps) ? proposal.steps : [];
+  if (!steps.length) return sendJson(res, 400, { error: 'Recipe has no steps.' });
+  for (let i = 0; i < steps.length; i++) {
+    if (!steps[i] || !toolNames.includes(steps[i].tool)) {
+      return sendJson(res, 400, { error: `Step ${i + 1} references unknown tool "${steps[i] && steps[i].tool}".` });
+    }
+  }
+
+  const cwd = getConfig().targetDir || process.cwd();
+  const list = readCustomRecipes(cwd).filter((r) => r.id !== id); // supersede a same-id re-approval
+  const saved = {
+    id,
+    description: proposal.description || '(no description)',
+    params: proposal.params && typeof proposal.params === 'object' ? proposal.params : {},
+    steps: steps.map((s) => ({ tool: s.tool, args: s.args && typeof s.args === 'object' ? s.args : {} })),
+    onFailureHint: proposal.onFailureHint || '',
+    approvedAt: new Date().toISOString(),
+  };
+  list.push(saved);
+  writeCustomRecipes(cwd, list);
+  sendJson(res, 200, { recipe: saved });
+}
+
+function handleGetRecipes(res) {
+  const cwd = getConfig().targetDir || process.cwd();
+  const builtins = recipeList.map((r) => ({ id: r.id, description: r.description, source: 'built-in' }));
+  const custom = readCustomRecipes(cwd).map((r) => ({
+    id: r.id,
+    description: r.description,
+    source: 'custom',
+    approvedAt: r.approvedAt,
+  }));
+  sendJson(res, 200, { recipes: [...builtins, ...custom] });
 }
 
 // ---------------------------------------------------------------------------
@@ -2190,6 +2343,26 @@ async function runLoop() {
     }
   }
 
+  // Phase 9: optional recipe-mining pass (opt-in via config.autoRecipeReview,
+  // mirroring autoAudit). Purely informational — candidates are surfaced for
+  // a human to review and POST /api/recipes/approve; nothing is ever
+  // auto-promoted.
+  if (!stopped() && !haltedBy && getConfig().autoRecipeReview) {
+    broadcast({ type: 'status', message: '🧩 Mining this run for recurring patterns…' });
+    try {
+      const candidates = await mineAndCurateRecipes(cwd);
+      broadcast({
+        type: 'recipe-candidates',
+        candidates,
+        message: candidates.length
+          ? `🧩 Found ${candidates.length} recurring pattern(s) — review with POST /api/recipes/approve.`
+          : '🧩 No recurring patterns found this run.',
+      });
+    } catch (e) {
+      broadcast({ type: 'log', log: `[recipe-mining] failed: ${e.message}\n` });
+    }
+  }
+
   // Feature 2: run over — nothing should still show as running.
   clearRunning();
 }
@@ -2221,6 +2394,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && pathname === '/api/planner-chat') return await handlePostPlannerChat(req, res);
     if (req.method === 'DELETE' && pathname === '/api/planner-chat') return handleDeletePlannerChat(res);
     if (req.method === 'POST' && pathname === '/api/audit') return await handleAudit(res);
+    if (req.method === 'POST' && pathname === '/api/recipes/mine') return await handleMineRecipes(res);
+    if (req.method === 'POST' && pathname === '/api/recipes/approve') return await handleApproveRecipe(req, res);
+    if (req.method === 'GET' && pathname === '/api/recipes') return handleGetRecipes(res);
     if (req.method === 'GET' && pathname === '/api/memory') return handleGetMemory(res);
     if (req.method === 'GET' && pathname.startsWith('/api/logs/')) {
       const id = decodeURIComponent(pathname.slice('/api/logs/'.length));

@@ -60,6 +60,7 @@ export const DEFAULT_ROLES = {
   lessoner: { client: 'claude', model: 'sonnet' },
   auditor: { client: 'claude', model: 'opus' },
   analyzer: { client: 'claude', model: 'sonnet' },
+  recipeCurator: { client: 'claude', model: 'sonnet' },
 };
 
 // ---------------------------------------------------------------------------

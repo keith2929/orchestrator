@@ -13,8 +13,9 @@ import healer from './healer.js';
 import lessoner from './lessoner.js';
 import auditor from './auditor.js';
 import analyzer from './analyzer.js';
+import recipeCurator from './recipeCurator.js';
 
-const REGISTRY = { planner, splitter, healer, lessoner, auditor, analyzer };
+const REGISTRY = { planner, splitter, healer, lessoner, auditor, analyzer, recipeCurator };
 
 export function getRoleModule(id) {
   const mod = REGISTRY[id];
