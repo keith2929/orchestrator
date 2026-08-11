@@ -72,6 +72,12 @@ export function normalizeTask(t, i, fallbackModel) {
     depends_on: Array.isArray(t.depends_on) ? t.depends_on : [],
   };
   if (t.green_test) norm.green_test = String(t.green_test);
+  // Phase 10: the MASTER_PROMPT.md heading this task derives from, captured
+  // once at plan time — used every replan cycle to resolve issue -> task ->
+  // relevant slice (see graph/masterPromptIndex.js). Text roles can't read
+  // files, so this pointer is what makes slicing possible instead of
+  // inlining the whole document or nothing.
+  if (t.source_section) norm.source_section = String(t.source_section);
   return norm;
 }
 

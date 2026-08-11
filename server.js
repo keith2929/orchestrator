@@ -33,7 +33,9 @@ import { createToolRunner } from './agent/toolRunner.js';
 import { toolList } from './agent/tools/index.js';
 import { getRecipe, recipeList } from './graph/recipes/index.js';
 import { detectProjectProfile } from './graph/projectProfile.js';
-import { mineCandidates, annotateCandidate } from './graph/recipeMiner.js';
+import { mineCandidates, annotateCandidate, normalize as normalizeText } from './graph/recipeMiner.js';
+import { buildIndex, resolveSection } from './graph/masterPromptIndex.js';
+import { assembleLoopPrompt } from './graph/loopPrompt.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
@@ -365,6 +367,17 @@ function markTaskCompleted(id) {
     arr.push(id);
     writeJson(FILES.completed, arr);
   }
+}
+
+// Phase 10: a plan is COMPLETE when every node has reached a terminal state
+// (done or aborted). Checked after ANY task settles — the unified scheduler
+// (every while-loop iteration) and handleRunOne (single-task manual runs) —
+// not just once at end-of-run, so "is this plan finished" is answered the
+// same way everywhere instead of re-derived ad hoc per call site.
+function isPlanComplete(tasks, completedIds, abortedIds) {
+  const completed = new Set(completedIds);
+  const aborted = new Set(abortedIds);
+  return (tasks || []).every((t) => completed.has(t.id) || aborted.has(t.id));
 }
 
 // One-shot LLM calls used by the planner-adjacent features (split, self-healing
@@ -725,7 +738,13 @@ async function handleSplit(req, res) {
     }
     const produced = splitResult.filter((e) => belongsTo(e, t.id));
     if (produced.length) {
-      produced.forEach((e) => consumed.add(e.id));
+      produced.forEach((e) => {
+        consumed.add(e.id);
+        // Phase 10: the splitter's own schema doesn't ask for source_section,
+        // so a split sub-task would otherwise lose the pointer entirely —
+        // inherit it mechanically from the parent candidate instead.
+        if (!e.source_section && t.source_section) e.source_section = t.source_section;
+      });
       merged.push(...produced);
     } else {
       merged.push(t); // splitter dropped it — keep the original rather than losing it
@@ -985,7 +1004,12 @@ async function runAudit(cwd) {
   const aborted = new Set(readJson(FILES.aborted, []));
   const taskLines = (Array.isArray(tasks) ? tasks : []).map((t) => {
     const status = completed.has(t.id) ? 'DONE' : aborted.has(t.id) ? 'ABORTED' : 'PENDING';
-    return `- [${status}] ${t.id} (${t.assigned_model}): ${t.description}`;
+    // Phase 10: green_test was collected at split time but never actually
+    // sent to the auditor — without it, the auditor has no way to know a
+    // task already has its own settled definition of done and re-litigates
+    // it instead of focusing on real gaps.
+    const test = t.green_test ? ` [green_test: ${t.green_test}]` : '';
+    return `- [${status}] ${t.id} (${t.assigned_model}): ${t.description}${test}`;
   });
   let sessionCtx = '';
   try {
@@ -1307,7 +1331,11 @@ async function handleRunOne(res, id) {
     await recordLesson(task);
   }
 
-  sse(res, { type: 'done', message: ok ? '✅ Task finished.' : '⛔ Task failed.' });
+  // Phase 10: checked here too, not just at end of a bulk run — a plan
+  // finished one manual "Start" click at a time is just as complete.
+  const allTasks = readJson(FILES.tasks, []);
+  const complete = isPlanComplete(allTasks, readJson(FILES.completed, []), readJson(FILES.aborted, []));
+  sse(res, { type: 'done', planComplete: complete, message: ok ? '✅ Task finished.' : '⛔ Task failed.' });
   if (!clientGone) res.end();
 }
 
@@ -2063,9 +2091,48 @@ async function handleRun(res) {
   startRunLoop();
 }
 
+// Phase 10: same detach/subscribe/resume pattern as the ordinary run loop
+// (startRunLoop/handleRun) — the goal loop is just a different top-level
+// driver over the same runManager, so it gets connection resilience,
+// reattachment, and POST /api/run/stop for free.
+function startGoalLoop() {
+  if (runManager.active) return;
+  runManager.active = true;
+  runManager.stopRequested = false;
+  runGoalLoop()
+    .catch((e) => {
+      broadcast({ type: 'error', message: `⛔ Goal loop crashed: ${e.message}` });
+    })
+    .finally(() => {
+      runManager.active = false;
+    });
+}
+
+async function handleGoalStart(res) {
+  setCors(res);
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  subscribeRun(res);
+
+  if (runManager.active) {
+    sse(res, { type: 'status', message: '📡 Reattached to an in-progress run.' });
+    return;
+  }
+  if (!fs.existsSync(FILES.master)) {
+    sse(res, { type: 'error', message: '⛔ No MASTER_PROMPT.md — generate a plan first.' });
+    sse(res, { type: 'done', message: 'done' });
+    return;
+  }
+  startGoalLoop();
+}
+
 // POST /api/run/stop — the explicit stop that used to be implied by closing
 // the SSE connection (Phase 2 and earlier). Cancels any pending auto-resume
 // too, since a user-requested stop should not silently restart itself.
+// Stops whichever driver (ordinary run or goal loop) is currently active.
 function handleStopRun(res) {
   runManager.stopRequested = true;
   clearPause();
@@ -2086,7 +2153,7 @@ function handleStopRun(res) {
 // Phase 4: detached from any single HTTP request — see runManager above.
 // stopRequested (not clientGone) is now the only thing that halts the loop.
 // ---------------------------------------------------------------------------
-async function runLoop() {
+async function runLoop({ skipEndOfRunExtras = false } = {}) {
   const cfg = getConfig();
   const cwd = cfg.targetDir || process.cwd();
   // Max tasks in flight at once. Tasks only actually run in parallel when
@@ -2197,10 +2264,11 @@ async function runLoop() {
     const pending = allTasks.filter(
       (t) => !isDone(t.id) && !isAborted(t.id) && !inFlight.has(t.id)
     );
-    if (pending.length === 0 && inFlight.size === 0) {
+    if (pending.length === 0 && inFlight.size === 0 && isPlanComplete(allTasks, [...completed], [...abortedSet])) {
       const nAborted = allTasks.filter((t) => isAborted(t.id)).length;
       broadcast({
         type: 'done',
+        planComplete: true,
         message: nAborted
           ? `⚠️ Run finished — ${nAborted} task(s) aborted.`
           : '✅ All tasks complete.',
@@ -2328,8 +2396,10 @@ async function runLoop() {
   // P5: optional Auditor pass at the end of the pipeline (opt-in via
   // config.autoAudit). Skipped when a provider limit cut the run short — the
   // work is incomplete by definition, and the audit would only burn more of
-  // the exhausted quota. Also skipped on an explicit stop, for the same reason.
-  if (!stopped() && !haltedBy && getConfig().autoAudit) {
+  // the exhausted quota. Also skipped on an explicit stop, for the same
+  // reason, and when the goal loop (Phase 10) is driving — it runs its own
+  // audit every cycle and this would just duplicate it.
+  if (!skipEndOfRunExtras && !stopped() && !haltedBy && getConfig().autoAudit) {
     broadcast({ type: 'status', message: '🔎 Auditor: reviewing the completed work…' });
     try {
       const audit = await runAudit(cwd);
@@ -2347,7 +2417,7 @@ async function runLoop() {
   // mirroring autoAudit). Purely informational — candidates are surfaced for
   // a human to review and POST /api/recipes/approve; nothing is ever
   // auto-promoted.
-  if (!stopped() && !haltedBy && getConfig().autoRecipeReview) {
+  if (!skipEndOfRunExtras && !stopped() && !haltedBy && getConfig().autoRecipeReview) {
     broadcast({ type: 'status', message: '🧩 Mining this run for recurring patterns…' });
     try {
       const candidates = await mineAndCurateRecipes(cwd);
@@ -2365,6 +2435,243 @@ async function runLoop() {
 
   // Feature 2: run over — nothing should still show as running.
   clearRunning();
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10: the goal-based autonomous loop.
+//
+//   tasks clear -> audit -> healer distills each high-severity issue
+//     -> requires_replan=false: seed affected_task.suggested_fix, requeue it
+//     -> requires_replan=true:  write loop-N.md, planner replans additively
+//     -> insert topologically-safely -> run -> repeat
+//
+// Capped at 5 cycles; an issue whose signature recurs after a heal attempt
+// is escalated (not retried identically) so a ping-pong failure can't burn
+// every remaining cycle making no progress.
+// ---------------------------------------------------------------------------
+const MAX_GOAL_CYCLES = 5;
+
+// A stable identity for "this is the same complaint as before", so a heal
+// attempt that didn't actually fix anything is detected even if the
+// auditor's wording drifts slightly between cycles. Reuses the recipe
+// miner's placeholder-normaliser rather than inventing a second one.
+function issueSignature(issue) {
+  return normalizeText(`${(issue && issue.task) || 'general'} ${(issue && issue.description) || ''}`);
+}
+
+// Un-terminals a task (drops it from completed/aborted) and seeds a
+// suggested_fix, so the next runLoop pass picks it back up as pending and
+// injects the fix into its prompt (the same fixBlock handleRetryTask
+// already uses). Returns false if the id doesn't exist — a general/
+// cross-cutting audit issue has no single task to requeue.
+function seedTaskFix(taskId, fixSummary) {
+  const tasks = readJson(FILES.tasks, []);
+  const idx = tasks.findIndex((t) => t.id === taskId);
+  if (idx === -1) return false;
+  if (fixSummary) tasks[idx].suggested_fix = fixSummary;
+  writeTasks(tasks);
+  writeJson(FILES.completed, readJson(FILES.completed, []).filter((id) => id !== taskId));
+  writeJson(FILES.aborted, readJson(FILES.aborted, []).filter((id) => id !== taskId));
+  return true;
+}
+
+// Mechanically gathers this cycle's brief (see graph/loopPrompt.js) and
+// writes it to .orchestrator/loops/loop-N.md. `healedIssues` is
+// [{ issue, heal }] — heal is the healer role's output for that issue.
+function writeLoopPrompt(cycle, healedIssues) {
+  const tasks = readJson(FILES.tasks, []);
+  const completed = new Set(readJson(FILES.completed, []));
+  const aborted = new Set(readJson(FILES.aborted, []));
+  const taskInventory = tasks.map((t) => ({
+    id: t.id,
+    status: completed.has(t.id) ? 'DONE' : aborted.has(t.id) ? 'ABORTED' : 'PENDING',
+    description: t.description || (t.tool ? `${t.tool}(${JSON.stringify(t.args || {})})` : '(no description)'),
+  }));
+
+  let master = '';
+  try {
+    master = fs.readFileSync(FILES.master, 'utf8');
+  } catch {
+    /* no master prompt */
+  }
+  const index = buildIndex(master);
+
+  // Resolution chain: audit issue -> affected task -> source_section -> slice.
+  const sectionNames = new Set();
+  for (const { issue } of healedIssues) {
+    const t = tasks.find((x) => x.id === issue.task);
+    if (t && t.source_section) sectionNames.add(t.source_section);
+  }
+  const sections = [...sectionNames]
+    .map((name) => ({ heading: name, text: resolveSection(index, name) }))
+    .filter((s) => s.text);
+
+  const text = assembleLoopPrompt({
+    cycle,
+    issues: healedIssues.map(({ issue, heal }) => ({
+      ...issue,
+      diagnosis: heal && heal.diagnosis,
+      fix_summary: heal && heal.fix_summary,
+    })),
+    taskInventory,
+    sections,
+  });
+
+  const dir = path.join(getStateDir(), 'loops');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    /* best-effort */
+  }
+  const file = path.join(dir, `loop-${cycle}.md`);
+  fs.writeFileSync(file, text);
+  return { path: file, text };
+}
+
+async function runGoalLoop() {
+  const cwd = getConfig().targetDir || process.cwd();
+  const stopped = () => runManager.stopRequested;
+  let previousSignatures = new Set();
+  const escalated = new Map(); // signature -> issue, for the final report
+
+  for (let cycle = 1; cycle <= MAX_GOAL_CYCLES; cycle++) {
+    if (stopped()) return;
+
+    broadcast({ type: 'status', message: `🎯 Goal loop cycle ${cycle}/${MAX_GOAL_CYCLES}: running pending tasks…` });
+    await runLoop({ skipEndOfRunExtras: true });
+    if (stopped()) return;
+
+    broadcast({ type: 'status', message: `🔎 Goal loop cycle ${cycle}: auditing…` });
+    let audit;
+    try {
+      audit = await runAudit(cwd);
+    } catch (e) {
+      broadcast({ type: 'error', message: `⛔ Goal loop stopped — auditor failed: ${e.message}` });
+      return;
+    }
+    broadcast({
+      type: 'audit',
+      cycle,
+      result: audit,
+      message: `🔎 Cycle ${cycle} audit: ${String(audit.verdict).toUpperCase()} — ${audit.summary}`,
+    });
+
+    if (audit.verdict === 'pass') {
+      broadcast({ type: 'goal-complete', cycle, message: `✅ Goal reached after ${cycle} cycle(s) — audit passed.` });
+      return;
+    }
+
+    const highIssues = audit.issues.filter((i) => i.severity === 'high');
+    const currentSignatures = new Set(highIssues.map(issueSignature));
+
+    // Oscillation guard: a signature that also showed up last cycle survived
+    // a heal attempt unchanged — retrying it identically would just burn the
+    // remaining cycles chasing the same ping-pong. Escalate instead.
+    const toHeal = [];
+    for (const issue of highIssues) {
+      const sig = issueSignature(issue);
+      if (previousSignatures.has(sig)) {
+        escalated.set(sig, issue);
+        broadcast({
+          type: 'status',
+          message: `⚠️ Issue recurred after a heal attempt — escalating instead of retrying: ${issue.description}`,
+        });
+      } else {
+        toHeal.push(issue);
+      }
+    }
+
+    if (!toHeal.length) {
+      broadcast({
+        type: 'goal-capped',
+        cycle,
+        escalated: [...escalated.values()],
+        message: `⛔ Every remaining issue has already been escalated — stopping at cycle ${cycle}.`,
+      });
+      return;
+    }
+
+    const healedIssues = []; // needs a replan
+    const requeued = []; // seeded + requeued directly
+    for (const issue of toHeal) {
+      if (stopped()) return;
+      let heal;
+      try {
+        heal = await runRole('healer', {
+          taskId: issue.task,
+          description: issue.description,
+          errorLog: issue.suggested_fix || issue.description,
+        });
+      } catch (e) {
+        broadcast({ type: 'log', log: `[goal-loop] healer failed for "${issue.description}": ${e.message}\n` });
+        continue;
+      }
+      if (!heal.requires_replan && seedTaskFix(heal.affected_task || issue.task, heal.fix_summary)) {
+        requeued.push(heal.affected_task || issue.task);
+      } else {
+        // Either the healer asked for a replan, or there was no concrete
+        // task to requeue (a general/cross-cutting issue) — either way this
+        // needs new work, not just a retry.
+        healedIssues.push({ issue, heal });
+      }
+    }
+
+    if (requeued.length) {
+      broadcast({
+        type: 'status',
+        message: `🩹 Requeued ${requeued.length} task(s) with a suggested fix: ${requeued.join(', ')}`,
+      });
+    }
+
+    if (healedIssues.length) {
+      const { text: loopText } = writeLoopPrompt(cycle, healedIssues);
+      broadcast({ type: 'status', message: `📝 Wrote the cycle ${cycle} replan brief — extending the plan…` });
+      const existingIds = readJson(FILES.tasks, []).map((t) => t.id);
+      const { menu, fallback } = workerModelMenu();
+      let newTasks = [];
+      try {
+        newTasks = await runRole('planner', { mode: 'replan', loopPrompt: loopText, menu, fallback, existingIds, cwd });
+      } catch (e) {
+        broadcast({ type: 'log', log: `[goal-loop] replan failed: ${e.message}\n` });
+      }
+      // Backstop (belt-and-suspenders on top of planner.normalize's own
+      // filter): never let a replanned id collide with one that already
+      // exists, completed or not.
+      const additive = newTasks.filter((t) => !existingIds.includes(t.id));
+      if (additive.length) {
+        try {
+          writeTasks([...readJson(FILES.tasks, []), ...additive]);
+          broadcast({ type: 'status', message: `➕ Replan added ${additive.length} new task(s).` });
+        } catch (e) {
+          broadcast({ type: 'log', log: `[goal-loop] failed to insert replanned tasks: ${e.message}\n` });
+        }
+      }
+    }
+
+    if (!requeued.length && !healedIssues.length) {
+      broadcast({
+        type: 'goal-capped',
+        cycle,
+        escalated: [...escalated.values()],
+        message: `⛔ No actionable fix could be produced this cycle — stopping at cycle ${cycle}.`,
+      });
+      return;
+    }
+
+    previousSignatures = currentSignatures;
+  }
+
+  // Cap reached without a passing audit.
+  const finalAudit = await runAudit(cwd).catch(() => null);
+  broadcast({
+    type: 'goal-capped',
+    cycle: MAX_GOAL_CYCLES,
+    escalated: [...escalated.values()],
+    result: finalAudit,
+    message:
+      `⛔ Reached the ${MAX_GOAL_CYCLES}-cycle cap without a clean audit. ${escalated.size} issue(s) could not be ` +
+      'resolved automatically — consider clarifying or narrowing MASTER_PROMPT.md.',
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2427,6 +2734,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.method === 'GET' && pathname === '/api/run') return await handleRun(res);
     if (req.method === 'POST' && pathname === '/api/run/stop') return handleStopRun(res);
+    if (req.method === 'GET' && pathname === '/api/goal/start') return await handleGoalStart(res);
     if (req.method === 'GET' && pathname === '/api/health') {
       return sendJson(res, 200, { ok: true });
     }

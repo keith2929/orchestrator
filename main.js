@@ -813,10 +813,25 @@ splitBtn.addEventListener('click', async () => {
 });
 
 // --- Audit (P5): ask the auditor role to review the completed work ----------
-function renderAudit(body, result) {
+function renderAudit(body, result, extra = {}) {
   body.className = 'modal-body text';
   const v = String(result.verdict || 'unknown').toUpperCase();
   const color = v === 'PASS' ? 'var(--accent-2)' : v === 'FAIL' ? 'var(--danger)' : '#f6c177';
+  const cycleLine = extra.cycle
+    ? `<p class="lk">Goal loop cycle ${extra.cycle}${extra.maxCycles ? ` / ${extra.maxCycles}` : ''}</p>`
+    : '';
+  const escalatedBlock = (extra.escalated || []).length
+    ? `<p><strong>Escalated (recurred after a heal attempt — not retried further):</strong></p>` +
+      extra.escalated
+        .map(
+          (i) => `
+      <div class="lesson-item">
+        <div class="lh">[${escapeHtml(String(i.severity || '').toUpperCase())}] ${escapeHtml(i.task || 'general')}</div>
+        <div>${escapeHtml(i.description || '')}</div>
+      </div>`
+        )
+        .join('')
+    : '';
   const issues = (result.issues || [])
     .map(
       (i) => `
@@ -828,7 +843,9 @@ function renderAudit(body, result) {
     )
     .join('');
   body.innerHTML =
+    cycleLine +
     `<p style="font-size:15px;margin-top:0;"><strong style="color:${color};">Verdict: ${escapeHtml(v)}</strong></p>` +
+    escalatedBlock +
     `<p>${escapeHtml(result.summary || '')}</p>` +
     (issues || '<p class="empty">No issues reported.</p>');
 }
@@ -1044,6 +1061,7 @@ function detachRun() {
   }
   runBtn.disabled = false;
   runBtn.textContent = '▶️ Run All Pending';
+  if (goalBtn) goalBtn.textContent = '🎯 Run to Goal';
 }
 
 async function stopRun() {
@@ -1058,11 +1076,12 @@ async function stopRun() {
 // Subscribes to the (possibly already-running) backend loop. Used both by the
 // Run button and by boot-time auto-reattach, so a page reload mid-run picks
 // the live console back up instead of looking idle while work continues.
-function attachRun() {
+function attachRun(endpoint = '/api/run') {
   if (eventSource) return;
   runBtn.textContent = '⏹️ Stop';
+  if (goalBtn) goalBtn.textContent = endpoint === '/api/goal/start' ? '⏹️ Stop' : '🎯 Run to Goal';
 
-  eventSource = new EventSource(API_BASE + '/api/run');
+  eventSource = new EventSource(API_BASE + endpoint);
   refreshTimer = setInterval(loadTasks, 3000);
 
   eventSource.onmessage = (ev) => {
@@ -1101,10 +1120,26 @@ function attachRun() {
         log('\n' + (msg.message || 'Task skipped') + '\n', 'status-line');
         break;
       case 'audit':
-        log('\n' + (msg.message || 'Audit complete') + '\n', 'status-line');
+        log('\n' + (msg.cycle ? `[cycle ${msg.cycle}] ` : '') + (msg.message || 'Audit complete') + '\n', 'status-line');
         (msg.result && msg.result.issues ? msg.result.issues : []).forEach((i) =>
           log(`  • [${String(i.severity || '').toUpperCase()}] ${i.task || 'general'}: ${i.description}\n`)
         );
+        break;
+      case 'goal-complete':
+        log('\n' + (msg.message || 'Goal reached') + '\n', 'status-line');
+        loadTasks();
+        detachRun();
+        break;
+      case 'goal-capped':
+        log('\n' + (msg.message || 'Goal loop stopped') + '\n', 'status-err');
+        (msg.escalated || []).forEach((i) =>
+          log(`  ⚠ escalated [${String(i.severity || '').toUpperCase()}] ${i.task || 'general'}: ${i.description}\n`)
+        );
+        loadTasks();
+        detachRun();
+        break;
+      case 'recipe-candidates':
+        log('\n' + (msg.message || 'Recipe mining complete') + '\n', 'status-line');
         break;
       case 'error':
         log('\n' + (msg.message || 'Error') + '\n', 'status-err');
@@ -1156,6 +1191,31 @@ runBtn.addEventListener('click', async () => {
   }
   log('\n=== Run started ===\n', 'status-line');
   attachRun();
+});
+
+// --- Run to Goal (Phase 10): run -> audit -> heal/replan -> repeat, capped
+// at 5 cycles, entirely unattended. Shares the Stop button's semantics with
+// the ordinary run since both drive the same server-side runManager.
+const goalBtn = el('goalBtn');
+goalBtn?.addEventListener('click', async () => {
+  if (eventSource) {
+    log('\n=== Stop requested ===\n', 'status-line');
+    await stopRun();
+    return;
+  }
+  if (!state.tasks.length) {
+    log('No tasks to run. Generate a plan first.\n', 'status-err');
+    return;
+  }
+  if (targetDir.value.trim()) {
+    const ok = await saveDir(true);
+    if (!ok) {
+      log(`\nRun aborted: ${dirStatus.textContent}\n`, 'status-err');
+      return;
+    }
+  }
+  log('\n=== Goal loop started (run -> audit -> heal/replan -> repeat) ===\n', 'status-line');
+  attachRun('/api/goal/start');
 });
 
 // --- Boot ------------------------------------------------------------------
