@@ -14,7 +14,7 @@
 - [x] Step 2 — Extract pure logic into `core/`
 - [x] Step 3 — Tests for the already-pure modules
 - [x] Step 4 — Durable task state
-- [ ] Step 5 — Crash recovery
+- [x] Step 5 — Crash recovery
 - [ ] Step 6 — Worker timeout, stall and repetition guards
 - [ ] Step 7 — Resurrect `memory.json`
 - [ ] Step 8 — Project-scope `logs/` and `error_logs/`
