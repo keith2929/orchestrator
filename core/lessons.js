@@ -40,6 +40,16 @@ export function lessonRelevance(lesson, keywords, files) {
   return score;
 }
 
+// Step 7: entries written before keyword/file tagging existed all score 0 in
+// lessonRelevance and get filtered out forever — this makes ranking work
+// retroactively instead of reintroducing recency-based selection. A pure
+// function so it's easy to prove a legacy entry now scores > 0.
+export function backfillLesson(entry) {
+  if (Array.isArray(entry.keywords) && entry.keywords.length) return entry;
+  const text = [entry.error_summary, entry.root_cause, entry.lesson].filter(Boolean).join(' ');
+  return { ...entry, keywords: extractKeywords(text), files: Array.isArray(entry.files) ? entry.files : [] };
+}
+
 // Ranks `memory` entries against `ctx` — a single task, or (for the
 // splitter) an array of candidate tasks — by keyword/file overlap. Returns
 // [] when nothing overlaps at all.

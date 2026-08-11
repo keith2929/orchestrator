@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractKeywords, lessonTopicKey, lessonRelevance, rankLessons } from '../core/lessons.js';
+import { extractKeywords, lessonTopicKey, lessonRelevance, rankLessons, backfillLesson } from '../core/lessons.js';
 
 test('extractKeywords filters stopwords', () => {
   const kws = extractKeywords('The build was not passing because of a WACC calculation issue');
@@ -45,4 +45,23 @@ test('rankLessons orders by file match over keyword match', () => {
 test('rankLessons returns [] when nothing overlaps', () => {
   const memory = [{ id: 'x', keywords: ['unrelated'], files: [] }];
   assert.deepEqual(rankLessons(memory, { description: 'totally different topic' }, 3), []);
+});
+
+test('backfillLesson leaves an already-tagged entry untouched', () => {
+  const entry = { id: 'a', keywords: ['wacc'], files: [] };
+  assert.strictEqual(backfillLesson(entry), entry);
+});
+
+test('backfillLesson derives keywords for a legacy entry with none, and it then scores > 0', () => {
+  // The regression test for the dead-memory bug: every entry in the wild
+  // predates keyword/file tagging (Phase 8), so lessonRelevance always
+  // scored 0 and lessonsBlock's score>0 filter dropped every lesson.
+  const legacy = { id: 'mem-1', error_summary: 'WACC calculation used stale beta', root_cause: 'beta not refreshed', lesson: 'always refetch beta before computing WACC' };
+  const backfilled = backfillLesson(legacy);
+  assert.ok(backfilled.keywords.length > 0);
+  assert.deepEqual(backfilled.files, []);
+
+  const ranked = rankLessons([backfilled], { description: 'Fix the WACC beta calculation' }, 3);
+  assert.equal(ranked.length, 1);
+  assert.equal(ranked[0].id, 'mem-1');
 });

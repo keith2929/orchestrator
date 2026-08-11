@@ -19,7 +19,7 @@ import { readJson, writeJson, readJsonFile } from './core/jsonStore.js';
 import { topoSortTasks, uniqueFixId, isPlanComplete, issueSignature } from './core/taskGraph.js';
 import { readTaskState, setTaskState, runningEntries, classifyInterrupted, endAttempt, isStalled, shouldBlock } from './core/taskState.js';
 import crypto from 'node:crypto';
-import { extractKeywords, lessonTopicKey, rankLessons } from './core/lessons.js';
+import { extractKeywords, lessonTopicKey, rankLessons, backfillLesson } from './core/lessons.js';
 
 // Load .env into process.env FIRST — before any module below captures a snapshot
 // of the environment (e.g. shared.js CHILD_ENV) or reads a key. env.js loads on
@@ -399,8 +399,13 @@ const runningControllers = new Map();
 // lessons just because they're the 5 most recent.
 // ---------------------------------------------------------------------------
 function readMemory() {
-  const m = readJson(FILES.memory, []);
-  return Array.isArray(m) ? m : [];
+  const raw = readJson(FILES.memory, []);
+  const m = Array.isArray(raw) ? raw : [];
+  const backfilled = m.map(backfillLesson);
+  // Only write back if backfilling actually changed something — most reads
+  // happen mid-run and shouldn't churn the file every time.
+  if (JSON.stringify(backfilled) !== JSON.stringify(m)) writeJson(FILES.memory, backfilled);
+  return backfilled;
 }
 
 // Cheap, deterministic, zero-LLM keyword extraction — used both to tag a
