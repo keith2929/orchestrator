@@ -16,6 +16,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readJson, writeJson, readJsonFile } from './core/jsonStore.js';
+import { topoSortTasks, uniqueFixId, isPlanComplete, issueSignature } from './core/taskGraph.js';
+import { extractKeywords, lessonTopicKey, rankLessons } from './core/lessons.js';
 
 // Load .env into process.env FIRST — before any module below captures a snapshot
 // of the environment (e.g. shared.js CHILD_ENV) or reads a key. env.js loads on
@@ -34,7 +36,7 @@ import { createToolRunner } from './agent/toolRunner.js';
 import { toolList } from './agent/tools/index.js';
 import { getRecipe, recipeList } from './graph/recipes/index.js';
 import { detectProjectProfile } from './graph/projectProfile.js';
-import { mineCandidates, annotateCandidate, normalize as normalizeText } from './graph/recipeMiner.js';
+import { mineCandidates, annotateCandidate } from './graph/recipeMiner.js';
 import { buildIndex, resolveSection } from './graph/masterPromptIndex.js';
 import { assembleLoopPrompt } from './graph/loopPrompt.js';
 
@@ -176,34 +178,6 @@ function getConfig() {
 // rejects a dangling reference or a cycle rather than persisting a plan the
 // scheduler could get stuck on.
 // ---------------------------------------------------------------------------
-function topoSortTasks(tasks) {
-  const byId = new Map(tasks.map((t) => [t.id, t]));
-  for (const t of tasks) {
-    for (const dep of t.depends_on || []) {
-      if (!byId.has(dep)) {
-        throw new Error(`Task "${t.id}" depends_on unknown task "${dep}".`);
-      }
-    }
-  }
-  const visited = new Set();
-  const visiting = new Set();
-  const ordered = [];
-  function visit(t) {
-    if (visited.has(t.id)) return;
-    if (visiting.has(t.id)) {
-      throw new Error(`Circular dependency involving "${t.id}".`);
-    }
-    visiting.add(t.id);
-    for (const dep of t.depends_on || []) visit(byId.get(dep));
-    visiting.delete(t.id);
-    visited.add(t.id);
-    ordered.push(t);
-  }
-  // Preserve original relative order among tasks with no ordering constraint
-  // between them — only reorder when depends_on actually forces it.
-  for (const t of tasks) visit(t);
-  return ordered;
-}
 // ---------------------------------------------------------------------------
 // Phase 7: recipe expansion. A type:"recipe" node ({ id, type, depends_on,
 // recipe, params }) is a REFERENCE, never executed directly — it is replaced
@@ -311,18 +285,6 @@ function expandRecipeNodes(tasks, cwd) {
   return out;
 }
 
-// Auto-inserted fix-task ids need a uniqueness suffix — plain `${baseId}.fix`
-// collides if the same node fails twice across retries.
-function uniqueFixId(baseId, existingIds) {
-  let candidate = `${baseId}.fix`;
-  let n = 2;
-  while (existingIds.has(candidate)) {
-    candidate = `${baseId}.fix${n}`;
-    n++;
-  }
-  return candidate;
-}
-
 function writeTasks(tasks) {
   const cwd = getConfig().targetDir || process.cwd();
   const expanded = expandRecipeNodes(tasks, cwd);
@@ -354,12 +316,6 @@ function markTaskCompleted(id) {
 // (every while-loop iteration) and handleRunOne (single-task manual runs) —
 // not just once at end-of-run, so "is this plan finished" is answered the
 // same way everywhere instead of re-derived ad hoc per call site.
-function isPlanComplete(tasks, completedIds, abortedIds) {
-  const completed = new Set(completedIds);
-  const aborted = new Set(abortedIds);
-  return (tasks || []).every((t) => completed.has(t.id) || aborted.has(t.id));
-}
-
 // One-shot LLM calls used by the planner-adjacent features (split, self-healing
 // retry, lesson capture) now go through resolveRole(<role>).complete(prompt),
 // which picks the configured provider/model per role. See roles.js. The old
@@ -418,56 +374,13 @@ function readMemory() {
 // lesson at write time and to rank stored lessons against a task's own text
 // at read time. Not NLP-grade; it only needs to catch obvious overlap
 // ("edgar", "wacc", "beta") to keep an unrelated task's prompt clean.
-const KEYWORD_STOPWORDS = new Set([
-  'the', 'a', 'an', 'and', 'or', 'but', 'of', 'to', 'in', 'on', 'for', 'with',
-  'is', 'are', 'be', 'this', 'that', 'it', 'as', 'at', 'by', 'from', 'into',
-  'your', 'you', 'if', 'not', 'no', 'was', 'were', 'will', 'must', 'should',
-]);
-function extractKeywords(text, max = 12) {
-  const words = String(text || '')
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((w) => w.length > 3 && !KEYWORD_STOPWORDS.has(w));
-  return [...new Set(words)].slice(0, max);
-}
-
-// A stable identity for "what this lesson is about", used to supersede a
-// stale/contradicting entry rather than let both sit in the list forever —
-// ranking alone doesn't fix two lessons that flatly disagree. Prefers the
-// files touched (strongest signal), then the lesson's own top keywords, and
-// only falls back to the originating task id (so re-failing the exact same
-// task at least supersedes its own prior entry).
-function lessonTopicKey(entry) {
-  if (Array.isArray(entry.files) && entry.files.length) return entry.files.slice().sort().join('|');
-  if (Array.isArray(entry.keywords) && entry.keywords.length >= 2) return entry.keywords.slice(0, 2).sort().join('|');
-  return entry.taskId || entry.id;
-}
-
-function lessonRelevance(lesson, keywords, files) {
-  let score = 0;
-  const lessonFiles = Array.isArray(lesson.files) ? lesson.files : [];
-  const lessonKeywords = Array.isArray(lesson.keywords) ? lesson.keywords : [];
-  for (const f of files) if (lessonFiles.includes(f)) score += 5; // an exact file match is a strong signal
-  for (const k of keywords) if (lessonKeywords.includes(k)) score += 1;
-  return score;
-}
-
 // Prompt fragment listing the stored lessons relevant to `ctx` — a single
 // task, or (for the splitter) an array of candidate tasks — ranked by
 // keyword/file overlap, or [] when nothing overlaps at all. This is the
 // fix for both "every task prompt" and "every splitter prompt" blindly
 // inlining the same last-5-by-recency list regardless of relevance.
 function lessonsBlock(ctx, n = 3) {
-  const tasksArr = Array.isArray(ctx) ? ctx : ctx ? [ctx] : [];
-  const keywords = extractKeywords(tasksArr.map((t) => t.description || '').join(' '));
-  const files = tasksArr.flatMap((t) => (Array.isArray(t.files) ? t.files : []));
-
-  const relevant = readMemory()
-    .map((l) => ({ l, score: lessonRelevance(l, keywords, files) }))
-    .filter((s) => s.score > 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, n)
-    .map((s) => s.l);
+  const relevant = rankLessons(readMemory(), ctx, n);
 
   if (!relevant.length) return [];
   return [
@@ -2430,14 +2343,6 @@ async function runLoop({ skipEndOfRunExtras = false } = {}) {
 // every remaining cycle making no progress.
 // ---------------------------------------------------------------------------
 const MAX_GOAL_CYCLES = 5;
-
-// A stable identity for "this is the same complaint as before", so a heal
-// attempt that didn't actually fix anything is detected even if the
-// auditor's wording drifts slightly between cycles. Reuses the recipe
-// miner's placeholder-normaliser rather than inventing a second one.
-function issueSignature(issue) {
-  return normalizeText(`${(issue && issue.task) || 'general'} ${(issue && issue.description) || ''}`);
-}
 
 // Un-terminals a task (drops it from completed/aborted) and seeds a
 // suggested_fix, so the next runLoop pass picks it back up as pending and
