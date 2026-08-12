@@ -1,16 +1,21 @@
 # 🎛️ claude-orchestrator
 
-A tiny, self-contained web app that orchestrates multi-step development tasks
-with the [`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI.
+A self-contained web app that orchestrates multi-step development tasks with the
+[`claude`](https://docs.anthropic.com/en/docs/claude-code) CLI (and, optionally, any
+OpenAI-compatible chat model as a worker or planner).
 
-You give it a **master prompt**; it asks Claude to break the work into an ordered
-task list; you tune the **model** and **effort** per task; then it runs the tasks
-sequentially, streaming logs to a live console.
+You give it a **master prompt**; the planner breaks the work into a dependency-ordered
+task graph; you tune the **model** and **effort** per task; then it runs the tasks —
+sequentially or in parallel, in dependency order — streaming logs to a live console. A
+goal loop can drive multiple plan → run → audit → replan cycles unattended. See
+`docs/DESIGN.md` for the architecture and `HARDENING_PLAN.md` for the reliability work
+that makes an unattended run survive a crash, a stall, or a repeated failure.
 
-- **Backend:** Node.js native `http` (no Express, no dependencies).
+- **Backend:** Node.js native `http`, zero npm dependencies.
 - **Frontend:** vanilla HTML/CSS/JS (no framework).
 - **Bundler:** Vite (the only dev dependency).
-- **State:** flat files — `tasks.json`, `completed.json`, `config.json`. No database.
+- **State:** flat files under `<targetDir>/.orchestrator/` — no database. See
+  `docs/DESIGN.md` § State.
 
 ---
 
@@ -26,28 +31,30 @@ You also need the `claude` CLI installed and authenticated, and on your `PATH`:
 claude --version
 ```
 
-If your `claude` binary lives elsewhere, set `CLAUDE_BIN` (see below).
+If your `claude` binary lives elsewhere, set `CLAUDE_BIN` (see below). To use a
+non-Claude model as a worker or planner, add its client + API key — see
+`docs/history/MODEL_AGNOSTIC_PLAN.md` § "Using a non-Claude provider".
 
 ## 2. Local testing
 
-The app has two processes: the backend (`:3001`) and the Vite dev server (`:5173`).
+The app has two processes: the backend (`:3001`, loopback-only) and the Vite dev server
+(`:5173`).
 
-**Windows (PowerShell) — run each in its own terminal:**
+**One-click (Linux/macOS):** `./run.sh` starts both as detached background processes and
+opens your browser; `./stop.sh` stops them. Logs land in `.run/`.
+
+**Manual — Windows (PowerShell), run each in its own terminal:**
 
 ```powershell
 npm run server    # terminal 1  -> backend on http://localhost:3001
 npm run client    # terminal 2  -> UI on http://localhost:5173
 ```
 
-**macOS / Linux — one command:**
+**Manual — macOS / Linux, one command:**
 
 ```bash
 npm run dev       # backgrounds the server (&) and starts Vite
 ```
-
-> Why the split on Windows? The `npm run dev` script uses a bash-style `&` to
-> background the server, which doesn't do concurrent processes in PowerShell/cmd.
-> Running the two scripts in separate terminals is the reliable cross-platform way.
 
 Then open **http://localhost:5173** and:
 
@@ -55,80 +62,90 @@ Then open **http://localhost:5173** and:
 2. Upload `MASTER_PROMPT.md` (or paste the prompt).
 3. Click **🧠 Generate Plan**.
 4. Tweak model/effort dropdowns (auto-saved).
-5. Click **▶️ Run All Pending** and watch Panel 3.
+5. Click **▶️ Run All Pending** and watch the live console.
 
 ## 3. Environment variables
 
 | Variable       | Where     | Default            | Purpose                                            |
-| -------------- | --------- | ------------------ | -------------------------------------------------- |
-| `VITE_API_URL` | frontend  | `''` (same-origin) | Base URL of the backend in production (Netlify).   |
-| `CLAUDE_BIN`   | backend   | `claude`           | Path to the `claude` executable.                   |
-| `PORT`         | backend   | `3001`             | Backend port.                                      |
+| -------------- | --------- | ------------------ | --------------------------------------------------- |
+| `VITE_API_URL` | frontend  | `''` (same-origin) | Base URL of the backend, if not same-origin.        |
+| `CLAUDE_BIN`   | backend   | `claude`           | Path to the `claude` executable.                    |
+| `PORT`         | backend   | `3001`              | Backend port (bound to `127.0.0.1` only).            |
+| `CONCURRENCY`  | backend   | `config.json`'s `maxConcurrency`, else `3` | Max tasks in flight at once. |
+
+Provider API keys (for non-Claude clients) live in a gitignored `.env` at the repo root —
+set via the 🔑 key panel in the UI, or `export`ed before `./run.sh`. See `env.js`.
 
 Locally you don't set `VITE_API_URL` — Vite proxies `/api` to `:3001`, so it's
-same-origin and CORS-free.
+same-origin. The backend allow-lists only the Vite dev server's own origin
+(`http://localhost:5173` / `http://127.0.0.1:5173`) — see § Security below.
 
 ---
 
-## 4. Deploying the frontend to Netlify
+## 4. Security
 
-Only the **frontend** is deployed; the backend stays on your machine (§5).
+The backend executes `claude --permission-mode bypassPermissions` (or a chat model's own
+tool loop) with real file-write and shell-command ability inside whatever `targetDir`
+`config.json` points at, with no per-action prompts. Only point `targetDir` at a project
+you're comfortable letting an agent modify autonomously.
 
-```bash
-npm run build     # outputs static site to ./dist
-```
+To keep this local-only:
 
-**Netlify setup:**
+- The server binds `127.0.0.1` — nothing on your LAN or the public internet can reach it,
+  regardless of firewall rules.
+- Cross-origin requests are rejected (403) unless the `Origin` is the Vite dev server's own
+  (`localhost:5173` / `127.0.0.1:5173`). A same-origin request (curl, the app's own health
+  checks — no `Origin` header at all) is unaffected; this only stops a page in another tab
+  from `fetch()`-ing your backend.
+- `agent/toolRunner.js`'s write path rejects any target under `.orchestrator/` — a worker
+  can read `session_context.md` there but never mutate the task graph, recipes, or memory
+  it's being driven by (see `docs/DESIGN.md` § Locked decisions).
 
-- **Build command:** `npm run build`
-- **Publish directory:** `dist`
-- **Environment variable:** `VITE_API_URL` = your Cloudflare Tunnel URL (see §5).
-
-You can point your Porkbun domain at the Netlify site via Netlify's *Domain
-management → Add custom domain*, then update your Porkbun DNS to Netlify's
-nameservers (or add the `CNAME`/`A` records Netlify shows you).
-
-## 5. Connecting the public frontend to your local backend (Cloudflare Tunnel)
-
-The backend runs `claude` on **your** machine, so the Netlify site needs a public
-tunnel to reach it.
-
-1. **Install cloudflared** — https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
-2. Start your backend: `npm run server`
-3. In another terminal, open a quick tunnel:
-
-   ```bash
-   cloudflared tunnel --url http://localhost:3001
-   ```
-
-4. Copy the public URL it prints, e.g. `https://random-name.trycloudflare.com`.
-5. In Netlify, set the env var and redeploy:
-
-   ```
-   VITE_API_URL = https://random-name.trycloudflare.com
-   ```
-
-6. Redeploy the frontend. The public website now talks to the backend running on
-   your local machine.
-
-> The backend already sets `Access-Control-Allow-Origin: *`, so the cross-origin
-> Netlify → tunnel calls work. Quick-tunnel URLs change every restart; for a
-> stable URL use a named Cloudflare tunnel.
+There is no further sandbox: `run_bash` is a real shell and can escape `targetDir` via an
+absolute path or `cd`. This is the same trust model as running `claude` with
+`--permission-mode bypassPermissions` directly.
 
 ---
 
 ## API reference
 
-| Method | Path             | Body / Notes                                             |
-| ------ | ---------------- | ------------------------------------------------------- |
-| POST   | `/api/plan`      | `{ prompt, targetDir }` → generates & saves tasks       |
-| POST   | `/api/config`    | `{ targetDir }` → set build dir (validates it exists)   |
-| GET    | `/api/tasks`     | → `{ tasks, completed, targetDir }`                     |
-| PUT    | `/api/tasks/:id` | patch `assigned_model` / `effort` / `description`       |
-| GET    | `/api/run`       | Server-Sent Events; runs pending tasks in order         |
-| GET    | `/api/health`    | → `{ ok: true }`                                        |
+Generated from the router in `server.js`. `id` in a `:id` segment is URL-encoded; `run`
+(`GET /api/run`, `GET /api/goal/start`) streams **Server-Sent Events**, everything else
+returns JSON.
 
----
+| Method | Path                        | Notes                                                        |
+| ------ | --------------------------- | -------------------------------------------------------------- |
+| POST   | `/api/plan`                 | `{ prompt, targetDir }` → planner generates & saves `tasks.json` |
+| POST   | `/api/split`                | Splits a task with unclear scope into smaller sub-tasks       |
+| POST   | `/api/concurrency`          | `{ maxConcurrency }` → persisted to `config.json`              |
+| POST   | `/api/config`               | `{ targetDir }` → set build dir (validated to exist)            |
+| GET    | `/api/tasks`                | `{ tasks, completed, aborted, running, maxConcurrency, targetDir }` |
+| PUT    | `/api/tasks/:id`            | Patch `assigned_model` / `effort` / `description` / `depends_on` |
+| GET    | `/api/tasks/:id/run`        | SSE — run just this one task                                   |
+| POST   | `/api/tasks/:id/stop`       | Abort a currently-running task                                 |
+| POST   | `/api/tasks/:id/retry`      | Self-healing retry — asks the healer role for a suggested fix  |
+| POST   | `/api/retry-all`            | Retries every aborted task                                     |
+| GET    | `/api/models`                | Capability-filtered model list, sourced from `config.json`'s `clients` |
+| POST   | `/api/roles`                 | `{ role, client, model, fallback? }` → persisted role routing  |
+| GET    | `/api/keys`                  | Which provider API keys are set (masked hint only, never the value) |
+| POST   | `/api/keys`                  | `{ id, key }` → writes to `.env`, applies to the running process |
+| GET    | `/api/planner-chat`          | Full persisted "chat with the planner" transcript              |
+| POST   | `/api/planner-chat`          | `{ message }` → one turn (replay to the model is windowed — step 9) |
+| DELETE | `/api/planner-chat`          | Clears the transcript                                          |
+| POST   | `/api/audit`                 | Runs the auditor role once against the current build           |
+| GET    | `/api/memory`                | The lessons-learned backlog (`memory.json`)                    |
+| POST   | `/api/memory/compact`        | `{ apply? }` → dedupe/graduate/propose over the memory backlog (dry-run by default — step 12) |
+| GET    | `/api/recipes`               | Built-in + this project's custom recipes (with version/status)  |
+| POST   | `/api/recipes/mine`          | Mines this project's history for recurring-work candidates      |
+| POST   | `/api/recipes/approve`       | `{ recipe }` → writes + publishes a new recipe version (step 11) |
+| GET    | `/api/logs/:id`              | Full tee'd run log for a task                                  |
+| GET    | `/api/context`               | Reference files available to workers                            |
+| POST   | `/api/context`               | Upload a reference file                                         |
+| DELETE | `/api/context/:name`         | Remove a reference file                                         |
+| GET    | `/api/run`                   | SSE — runs all pending tasks in dependency order                |
+| POST   | `/api/run/stop`              | Stops the run loop after the current task(s) finish              |
+| GET    | `/api/goal/start`            | SSE — the goal loop: plan → run → audit → replan, unattended     |
+| GET    | `/api/health`                | `{ ok: true }`                                                  |
 
 ## Notes on the `claude` CLI (important)
 
@@ -148,13 +165,12 @@ the tool **actually runs on first try**:
    `claude --model <model> --print` and feeds the prompt over **stdin** (which
    also dodges all shell-quoting problems with multi-line prompts). The requested
    effort level is embedded into the prompt text as a hint. If your CLI does
-   support `--effort`, there's a one-line switch in `buildArgs()` in `server.js`.
+   support `--effort`, there's a one-line switch in `clients/claude-cli.js`.
 
 2. **`/api/run` uses `spawn`, not `exec`.** `exec` buffers *all* output until the
    process exits, so it literally cannot stream a live console. `spawn` streams
-   stdout/stderr chunks as they happen — which is the whole point of Panel 3.
-   (Planning still uses `execFile` with `maxBuffer: 10MB` since it's a single
-   JSON result.)
+   stdout/stderr chunks as they happen — which is the whole point of the live console.
+   (Planning still uses `execFile` with a bounded buffer since it's a single JSON result.)
 
 If `claude` is missing or errors, the failure is surfaced verbatim in the UI —
 either in the plan status line or the live console.
@@ -163,11 +179,4 @@ either in the plan status line or the live console.
    it, a headless (`--print`) claude can't answer permission prompts, so it just
    *describes* the files it would create and exits 0 — the orchestrator then
    marks the task "done" while nothing was actually written. bypassPermissions
-   lets it write files autonomously.
-
-   ⚠️ **Safety:** this means each task runs with full tool permissions (file
-   writes, shell commands) inside your **Target Project Directory**, with no
-   prompts. Only point the target directory at a project you're comfortable
-   letting Claude modify freely. The directory is set via the **📁 Set
-   Directory** button (or automatically saved when you click Run), and the tool
-   validates it exists before saving so a typo can't silently build elsewhere.
+   lets it write files autonomously. See § Security above.

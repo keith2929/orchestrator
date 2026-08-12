@@ -1,14 +1,27 @@
 // claude-orchestrator — native Node.js backend (no Express, no deps).
 //
-// Responsibilities:
-//   POST /api/plan       -> save the master prompt, ask `claude` to break it
-//                           into a task list, persist tasks.json/completed.json
-//   GET  /api/tasks      -> return { tasks, completed }
-//   PUT  /api/tasks/:id  -> patch a single task (model / effort / etc.)
-//   GET  /api/run        -> Server-Sent Events: run pending tasks in order,
-//                           streaming logs live to the browser
+// See README.md for the full API reference and docs/DESIGN.md for the
+// architecture. In short: this file owns HTTP routing (the router is at the
+// bottom), the SSE run loop / scheduler, and the HTTP handlers — everything
+// that touches FILES, getConfig(), or the network. Pure logic that doesn't
+// live in core/:
+//   core/jsonStore.js       atomic JSON read/write (step 1)
+//   core/taskGraph.js       topo sort, plan-complete check, issue signatures
+//   core/taskState.js       durable task state, crash recovery, stall/repetition guards
+//   core/lessons.js         lesson ranking, backfill, dedupe/compaction
+//   core/sessionContext.js  bounding worker context (step 9)
+//   core/recipeStore.js     recipes as versioned files (step 11)
+//   core/recipeExpand.js    mechanical {{param}} substitution
+// and the rest of the import graph:
+//   clients/    raw model communication (kind:"cli" Claude, kind:"chat" OpenAI-compatible)
+//   agent/      generic tool-using conversation loop, for kind:"chat" workers
+//   execution/  dispatch by client kind -> native.js (spawn) | agent.js
+//   graph/      zero-LLM mechanical passes: recipe modules, recipe mining, prompt indexing
+//   roles.js    resolveRole(name) -> { complete(prompt) } / { chat(messages) }
 //
-// State lives in flat JSON files next to this script. No database.
+// State lives under <targetDir>/.orchestrator/ (see getStateDir() below) —
+// project-scoped, not in this repo. config.json (gitignored, seeded from
+// config.example.json) is the one file that stays next to this script.
 
 import http from 'node:http';
 import { execFile, execFileSync } from 'node:child_process';
