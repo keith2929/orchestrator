@@ -11,7 +11,7 @@
 // State lives in flat JSON files next to this script. No database.
 
 import http from 'node:http';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -433,15 +433,60 @@ function loadTaskState() {
 function readRunning() {
   return runningEntries(loadTaskState());
 }
-function addRunning(taskId) {
+// Synchronous counterpart to currentGitState() (below) — addRunning is
+// called from inside runTask/runToolNode's synchronous Promise executor, so
+// capturing the baseline here uses execFileSync rather than restructuring
+// those into async functions for one git call. Real evidence here (not
+// null) is what makes step 5's classifyInterrupted able to tell "this task
+// already changed the repo" apart from "never got anywhere" after a crash.
+function captureGitBaselineSync(cwd) {
+  try {
+    const head = execFileSync('git', ['-C', cwd, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+    const porcelain = execFileSync('git', ['-C', cwd, 'status', '--porcelain'], { maxBuffer: 4 * 1024 * 1024, encoding: 'utf8' });
+    return { head, porcelainHash: crypto.createHash('sha256').update(porcelain).digest('hex') };
+  } catch {
+    return null; // not a git repo, or git unavailable — recovery degrades to "no evidence"
+  }
+}
+
+function addRunning(taskId, cwd) {
   const now = Date.now();
   setTaskState(
     FILES.taskState,
     taskId,
     {
       status: 'in_progress',
-      current: { owner: null, leaseUntil: now + 3600000, startedAt: now, lastOutputAt: now, lastRepoChangeAt: now, gitBaseline: null },
+      current: {
+        owner: null,
+        leaseUntil: now + 3600000,
+        startedAt: now,
+        lastOutputAt: now,
+        lastRepoChangeAt: now,
+        gitBaseline: cwd ? captureGitBaselineSync(cwd) : null,
+      },
     },
+    { completedFile: FILES.completed, abortedFile: FILES.aborted }
+  );
+}
+// Bumps lastOutputAt on the in-flight record as output streams in — without
+// this, isStalled() would judge a legitimately chatty long task by a
+// timestamp frozen at launch and abort it as "stalled" even while it's
+// actively working. Throttled: called on every output chunk, but a
+// setTaskState is a full read-modify-write of task_state.json, so this
+// coalesces to at most one write per second per task.
+const lastOutputBumpAt = new Map();
+function bumpOutputActivity(taskId) {
+  const now = Date.now();
+  const last = lastOutputBumpAt.get(taskId) || 0;
+  if (now - last < 1000) return;
+  lastOutputBumpAt.set(taskId, now);
+  const state = loadTaskState();
+  const record = state[taskId];
+  if (!record || !record.current) return;
+  setTaskState(
+    FILES.taskState,
+    taskId,
+    { current: { ...record.current, lastOutputAt: now } },
     { completedFile: FILES.completed, abortedFile: FILES.aborted }
   );
 }
@@ -1971,7 +2016,7 @@ function runTask(task, cwd, emit) {
     ].join('\n');
 
     // Feature 2: mark this task running (persisted, survives page refresh).
-    addRunning(task.id);
+    addRunning(task.id, cwd);
 
     // Per-task stop: an AbortController that POST /api/tasks/:id/stop can
     // trigger to kill this task's subprocess mid-run.
@@ -2024,6 +2069,7 @@ function runTask(task, cwd, emit) {
     const emitLines = (chunk, isErr) => {
       const raw = typeof chunk === 'string' ? chunk : chunk.toString();
       tee(raw); // Feature 5: full, un-prefixed output to the per-task log file
+      bumpOutputActivity(task.id); // Step 6: keep isStalled's evidence honest for a chatty task
       let buf = (isErr ? errBuf : outBuf) + raw;
       let nl;
       while ((nl = buf.indexOf('\n')) !== -1) {
@@ -2122,7 +2168,7 @@ function runTask(task, cwd, emit) {
 // ---------------------------------------------------------------------------
 function runToolNode(node, cwd, emit) {
   return new Promise((resolve) => {
-    addRunning(node.id);
+    addRunning(node.id, cwd);
     const controller = new AbortController();
     runningControllers.set(node.id, controller);
 
@@ -2145,6 +2191,7 @@ function runToolNode(node, cwd, emit) {
         }
       }
       outAll = (outAll + line).slice(-OUT_CAP);
+      bumpOutputActivity(node.id); // Step 6: keep isStalled's evidence honest for a chatty tool node
       emit({ type: 'log', log: `[${node.id}] ${line}` });
     };
 
@@ -2551,33 +2598,45 @@ async function runLoop({ skipEndOfRunExtras = false } = {}) {
   // untouched still pending.
   let haltedBy = null;
 
-  while (!stopped()) {
-    // Step 6 watchdog: every iteration, check every task actually in flight
-    // in THIS process (runningControllers) for a stall or hard-ceiling
-    // breach and abort it — same controller a manual stop uses. Still-alive
-    // tasks get their lease bumped so a future second agent could tell a
-    // live task from an abandoned one.
-    {
-      const now = Date.now();
-      const liveState = loadTaskState();
-      for (const [id, ctrl] of runningControllers) {
-        const record = liveState[id];
-        if (!record) continue;
-        const { stalled, reason } = isStalled(record, now, workerLimits);
-        if (stalled) {
-          broadcast({ type: 'log', log: `⏱️ [${id}] ${reason} — aborting.\n` });
-          ctrl.abort();
-        } else if (record.current) {
-          setTaskState(
-            FILES.taskState,
-            id,
-            { current: { ...record.current, leaseUntil: now + workerLimits.stallMs } },
-            { completedFile: FILES.completed, abortedFile: FILES.aborted }
-          );
-        }
+  // Step 6 watchdog: the scheduler loop below BLOCKS on
+  // `Promise.race(inFlight.values())` while something is running, so a
+  // check placed inline at the top of the loop body would only ever run
+  // once something finishes — never while a single task hangs. A real
+  // timer, independent of that await, is what actually catches a stall.
+  // Checks every task in flight in THIS process (runningControllers) for a
+  // stall or hard-ceiling breach and aborts it — the same controller a
+  // manual stop uses. Still-alive tasks get their lease bumped so a future
+  // second agent could tell a live task from an abandoned one.
+  const watchdogIntervalMs = Math.max(1000, Math.min(workerLimits.stallMs / 4, 30000));
+  const watchdogTimer = setInterval(() => {
+    const now = Date.now();
+    const liveState = loadTaskState();
+    for (const [id, ctrl] of runningControllers) {
+      const record = liveState[id];
+      if (!record) continue;
+      const { stalled, reason } = isStalled(record, now, workerLimits);
+      if (stalled) {
+        broadcast({ type: 'log', log: `⏱️ [${id}] ${reason} — aborting.\n` });
+        ctrl.abort();
+      } else if (record.current) {
+        setTaskState(
+          FILES.taskState,
+          id,
+          { current: { ...record.current, leaseUntil: now + workerLimits.stallMs } },
+          { completedFile: FILES.completed, abortedFile: FILES.aborted }
+        );
       }
     }
+  }, watchdogIntervalMs);
 
+  try {
+    await runLoopScheduler();
+  } finally {
+    clearInterval(watchdogTimer);
+  }
+
+  async function runLoopScheduler() {
+  while (!stopped()) {
     const allTasks = readJson(FILES.tasks, []);
     const completed = new Set(readJson(FILES.completed, []));
     const isDone = (id) => completed.has(id);
@@ -2720,27 +2779,28 @@ async function runLoop({ skipEndOfRunExtras = false } = {}) {
 
       if (shouldBlock(record, workerLimits)) {
         markBlocked(done.id, `gave up after ${record.attempts} attempt(s) — see task_state.json history for details.`);
+        if (done.task.type === 'tool' && done.task.onFailure === 'spawn-task') {
+          const fixId = spawnFixTask(done.task, cwd);
+          if (fixId) {
+            broadcast({
+              type: 'status',
+              message: `🩹 Spawned fix task "${fixId}" for the failed step "${done.id}".`,
+            });
+          }
+        }
         continue;
       }
 
-      // Don't halt the whole plan: mark this one aborted and let the scheduler
-      // carry on with tasks that don't depend on it (dependents cascade to
-      // aborted at the top of the next loop).
-      markAborted(done.id);
+      // Step 6: attempts remain under maxAttempts and the failure hasn't
+      // repeated identically identicalFailureLimit times — requeue
+      // automatically (task_state.json is already back to 'pending' from
+      // endAttempt above) instead of giving up after one try. Only maxAttempts
+      // / an identical-failure streak (handled above) or a cascaded dependency
+      // failure ever produces a terminal aborted/blocked task now.
       broadcast({
-        type: 'task-aborted',
-        id: done.id,
-        message: `❌ ${done.id} could not be completed — marked aborted. Continuing with remaining tasks.`,
+        type: 'log',
+        log: `⚠️ ${done.id} failed (attempt ${record.attempts}/${workerLimits.maxAttempts}) — retrying.\n`,
       });
-      if (done.task.type === 'tool' && done.task.onFailure === 'spawn-task') {
-        const fixId = spawnFixTask(done.task, cwd);
-        if (fixId) {
-          broadcast({
-            type: 'status',
-            message: `🩹 Spawned fix task "${fixId}" for the failed step "${done.id}".`,
-          });
-        }
-      }
       continue;
     }
 
@@ -2753,6 +2813,7 @@ async function runLoop({ skipEndOfRunExtras = false } = {}) {
     // Feature 6: if this task had failed before (error log present), distill and
     // store the lesson learned, then clear the error log.
     await recordLesson(done.task);
+  }
   }
 
   // P5: optional Auditor pass at the end of the pipeline (opt-in via
