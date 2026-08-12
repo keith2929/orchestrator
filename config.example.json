@@ -1,5 +1,5 @@
 {
-  "targetDir": "/media/sf_github/valuation-calc",
+  "targetDir": "",
   "clients": {
     "claude": {
       "kind": "cli",

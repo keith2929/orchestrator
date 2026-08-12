@@ -18,5 +18,16 @@ config.json.bak
 *.bak-*
 .goutputstream-*
 
+# Step 14: config.json is rewritten at runtime (targetDir, roles, probed
+# models — see handleSetConfig) and carries a personal absolute targetDir, so
+# the repo was never clean and every branch dragged along whatever machine
+# last ran it. config.example.json (tracked) is the template; config.json is
+# seeded from it on first boot if absent — see getConfig() in server.js.
+config.json
+
+# Runtime lock holding a live pid — not source, and stale the moment the
+# process that wrote it exits.
+.claude/scheduled_tasks.lock
+
 # Project state now lives in <targetDir>/.orchestrator/ (see REDESIGN_PLAN.md
 # Phase 1) — nothing project-scoped stays in this repo anymore.

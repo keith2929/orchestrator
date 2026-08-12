@@ -79,6 +79,17 @@ const IS_WIN = process.platform === 'win32';
 // Phase 1). FILES is a Proxy so existing call sites (`FILES.tasks`, …) keep
 // working unchanged while resolving lazily against the *current* targetDir.
 const CONFIG_FILE = path.join(__dirname, 'config.json');
+const CONFIG_EXAMPLE_FILE = path.join(__dirname, 'config.example.json');
+// Step 14: config.json is now gitignored (it's rewritten at runtime and
+// carries a personal targetDir) — seed it from the tracked template on a
+// fresh checkout so the app still boots to something usable.
+if (!fs.existsSync(CONFIG_FILE) && fs.existsSync(CONFIG_EXAMPLE_FILE)) {
+  try {
+    fs.copyFileSync(CONFIG_EXAMPLE_FILE, CONFIG_FILE);
+  } catch {
+    /* best-effort — getConfig()/readJson already fail soft to {} */
+  }
+}
 
 const STATE_FILENAMES = {
   master: 'MASTER_PROMPT.md',
@@ -589,9 +600,20 @@ function recipeHintFor(recipeId, cwd) {
 // ---------------------------------------------------------------------------
 // HTTP plumbing
 // ---------------------------------------------------------------------------
+// Step 14: local-only lockdown. This backend executes arbitrary shell/model
+// commands with bypassPermissions in whatever `targetDir` config.json points
+// at — Access-Control-Allow-Origin: * meant ANY site open in ANY tab could
+// fetch() POST /api/config to repoint targetDir at $HOME, then GET /api/run,
+// with no preflight to block it (simple request) and `*` letting the page
+// read the replies. Only the Vite dev server's own origins are trusted.
+const ALLOWED_ORIGINS = new Set(['http://localhost:5173', 'http://127.0.0.1:5173']);
+// The router stashes the request's Origin header on `res` (no `req` is
+// threaded through the many sendJson(res, ...) call sites, so this is the
+// simplest way for setCors to see it without touching every handler).
 function setCors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
+  const origin = res._corsOrigin;
+  if (origin && ALLOWED_ORIGINS.has(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 function sendJson(res, status, body) {
@@ -3096,6 +3118,16 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const { pathname } = url;
 
+  // Step 14: reject any cross-origin request that isn't the Vite dev server.
+  // A same-origin request (curl, the backend's own health checks, no Origin
+  // header at all) has no Origin header and is allowed through — this is a
+  // browser-only restriction, matching what CORS itself only ever enforced.
+  res._corsOrigin = req.headers.origin;
+  if (req.headers.origin && !ALLOWED_ORIGINS.has(req.headers.origin)) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: 'Origin not allowed.' }));
+  }
+
   if (req.method === 'OPTIONS') {
     setCors(res);
     res.writeHead(204);
@@ -3161,7 +3193,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, async () => {
+server.listen(PORT, '127.0.0.1', async () => {
   // runningControllers is in-memory, so by definition nothing is in flight on
   // a fresh boot. Step 5: anything still "in_progress" from a backend that
   // was killed or crashed mid-run is recovered with evidence (git state +
