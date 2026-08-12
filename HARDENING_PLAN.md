@@ -23,7 +23,7 @@
 - [x] Step 11 — Recipes as versioned files
 - [x] Step 12 — Lesson compaction into recipes
 - [x] Step 13 — Smoke tests
-- [ ] Step 14 — Hygiene and local-only lockdown
+- [x] Step 14 — Hygiene and local-only lockdown
 - [ ] Step 15 — Documentation
 
 ## Goal
