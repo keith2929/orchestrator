@@ -22,7 +22,7 @@
 - [x] Step 10 — Workers cannot mutate the knowledge base
 - [x] Step 11 — Recipes as versioned files
 - [x] Step 12 — Lesson compaction into recipes
-- [ ] Step 13 — Smoke tests
+- [x] Step 13 — Smoke tests
 - [ ] Step 14 — Hygiene and local-only lockdown
 - [ ] Step 15 — Documentation
 
