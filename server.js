@@ -19,7 +19,7 @@ import { readJson, writeJson, readJsonFile } from './core/jsonStore.js';
 import { topoSortTasks, uniqueFixId, isPlanComplete, issueSignature } from './core/taskGraph.js';
 import { readTaskState, setTaskState, runningEntries, classifyInterrupted, endAttempt, isStalled, shouldBlock } from './core/taskState.js';
 import crypto from 'node:crypto';
-import { extractKeywords, lessonTopicKey, rankLessons, backfillLesson } from './core/lessons.js';
+import { extractKeywords, lessonTopicKey, rankLessons, backfillLesson, dedupeLessons } from './core/lessons.js';
 import { formatSessionContextBlock, rolloverContent, windowPlannerChat } from './core/sessionContext.js';
 import { substituteParams } from './core/recipeExpand.js';
 import {
@@ -47,7 +47,7 @@ import { createToolRunner } from './agent/toolRunner.js';
 import { toolList } from './agent/tools/index.js';
 import { getRecipe, recipeList } from './graph/recipes/index.js';
 import { detectProjectProfile } from './graph/projectProfile.js';
-import { mineCandidates, annotateCandidate } from './graph/recipeMiner.js';
+import { mineCandidates, annotateCandidate, clusterByText } from './graph/recipeMiner.js';
 import { buildIndex, resolveSection } from './graph/masterPromptIndex.js';
 import { assembleLoopPrompt } from './graph/loopPrompt.js';
 
@@ -1125,14 +1125,35 @@ async function handleApproveRecipe(req, res) {
   const cwd = getConfig().targetDir || process.cwd();
   const recipesDir = recipesDirFor(cwd);
   const cleanSteps = steps.map((s) => ({ tool: s.tool, args: s.args && typeof s.args === 'object' ? s.args : {} }));
+  const sourceLessons = Array.isArray(proposal.sourceLessons) ? proposal.sourceLessons.map(String) : [];
   const { path: candidatePath } = writeCandidate(recipesDir, {
     id,
     description: proposal.description || '(no description)',
     steps: cleanSteps,
     onFailureHint: proposal.onFailureHint || '',
+    sourceLessons,
   });
   const version = Number(/\.v(\d+)\.md$/.exec(candidatePath)[1]);
   const { record } = approveCandidate(recipesDir, id, version);
+
+  // Step 12: a proposal mined from memory.json backlog lessons carries their
+  // ids as sourceLessons — approving retires them out of memory.json into
+  // this version's file (already recorded in evidence.sourceLessons above),
+  // archiving rather than silently deleting.
+  if (sourceLessons.length) {
+    const idSet = new Set(sourceLessons);
+    const memory = readMemory();
+    const retired = memory.filter((l) => idSet.has(String(l.id || l.taskId)));
+    if (retired.length) {
+      const remaining = memory.filter((l) => !idSet.has(String(l.id || l.taskId)));
+      writeJson(FILES.memory, remaining);
+      const historyDir = path.join(getStateDir(), 'history');
+      fs.mkdirSync(historyDir, { recursive: true });
+      const archivePath = path.join(historyDir, `memory-compacted-${new Date().toISOString().slice(0, 10)}.json`);
+      writeJson(archivePath, [...readJson(archivePath, []), ...retired]);
+    }
+  }
+
   sendJson(res, 200, { recipe: record });
 }
 
@@ -1486,6 +1507,88 @@ function handleGetLog(res, id) {
 // ---------------------------------------------------------------------------
 function handleGetMemory(res) {
   sendJson(res, 200, { memory: readMemory() });
+}
+
+// ---------------------------------------------------------------------------
+// Step 12: POST /api/memory/compact — a re-runnable compaction pass over
+// memory.json, dry-run by default ({ apply: true } to commit):
+//   1. dedupe entries sharing a topic key (dedupeLessons — newest wins);
+//   2. graduate anything matching an existing recipe into that recipe's
+//      notes (reuses annotateCandidate's matchesExistingRecipe — the same
+//      check recordLesson already does going forward, applied
+//      retroactively to the backlog);
+//   3. cluster what's left with minSize 2 (looser than ordinary mining's 3
+//      — this is a one-off backlog pass, not the standing threshold) and
+//      report them as proposal clusters for a human to mine into real
+//      recipes via the existing POST /api/recipes/mine flow;
+//   4. archive everything removed under .orchestrator/history/ rather than
+//      deleting it outright.
+// Never auto-approves anything — proposals are reported only, and
+// graduation only touches recipe NOTES (recipe-notes.json), never a
+// recipe's own step definitions.
+// ---------------------------------------------------------------------------
+async function handleCompactMemory(req, res) {
+  const body = await readBody(req);
+  const apply = !!body.apply;
+  const cwd = getConfig().targetDir || process.cwd();
+  const profile = detectProjectProfile(cwd);
+
+  const memory = readMemory();
+  const { kept, removed: dupRemoved } = dedupeLessons(memory);
+
+  const lessonText = (l) => [l.error_summary, l.root_cause, l.lesson].filter(Boolean).join(' ');
+
+  const graduated = [];
+  const remaining = [];
+  for (const lesson of kept) {
+    const annotated = annotateCandidate({ members: [{ text: lessonText(lesson) }] }, profile);
+    if (annotated.matchesExistingRecipe) {
+      graduated.push({
+        lessonId: lesson.id || lesson.taskId,
+        recipeId: annotated.matchesExistingRecipe,
+        note: lesson.lesson || lesson.error_summary || lessonText(lesson),
+        lesson,
+      });
+    } else {
+      remaining.push(lesson);
+    }
+  }
+
+  // A looser threshold than ordinary mining (minSize 3) — this is a one-time
+  // pass over an existing backlog, not the standing mining config.
+  const clusters = clusterByText(
+    remaining.map((l) => ({ id: l.id || l.taskId, text: lessonText(l) })),
+    { minSize: 2 }
+  );
+  const proposals = clusters.map((c) => ({ size: c.length, memberIds: c.map((m) => m.id) }));
+
+  if (!apply) {
+    return sendJson(res, 200, {
+      removed: dupRemoved.length,
+      graduated: graduated.length,
+      proposals: proposals.length,
+      remaining: remaining.length,
+      details: { proposals },
+    });
+  }
+
+  for (const g of graduated) appendRecipeNote(g.recipeId, g.note);
+  writeJson(FILES.memory, remaining);
+
+  const archived = [...dupRemoved, ...graduated.map((g) => g.lesson)];
+  if (archived.length) {
+    const historyDir = path.join(getStateDir(), 'history');
+    fs.mkdirSync(historyDir, { recursive: true });
+    const archivePath = path.join(historyDir, `memory-compacted-${new Date().toISOString().slice(0, 10)}.json`);
+    writeJson(archivePath, [...readJson(archivePath, []), ...archived]);
+  }
+
+  sendJson(res, 200, {
+    removed: dupRemoved.length,
+    graduated: graduated.length,
+    proposals: proposals.length,
+    remaining: remaining.length,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2952,6 +3055,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && pathname === '/api/planner-chat') return await handlePostPlannerChat(req, res);
     if (req.method === 'DELETE' && pathname === '/api/planner-chat') return handleDeletePlannerChat(res);
     if (req.method === 'POST' && pathname === '/api/audit') return await handleAudit(res);
+    if (req.method === 'POST' && pathname === '/api/memory/compact') return await handleCompactMemory(req, res);
     if (req.method === 'POST' && pathname === '/api/recipes/mine') return await handleMineRecipes(res);
     if (req.method === 'POST' && pathname === '/api/recipes/approve') return await handleApproveRecipe(req, res);
     if (req.method === 'GET' && pathname === '/api/recipes') return handleGetRecipes(res);

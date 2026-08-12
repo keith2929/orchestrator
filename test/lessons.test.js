@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { extractKeywords, lessonTopicKey, lessonRelevance, rankLessons, backfillLesson } from '../core/lessons.js';
+import { extractKeywords, lessonTopicKey, lessonRelevance, rankLessons, backfillLesson, dedupeLessons } from '../core/lessons.js';
 
 test('extractKeywords filters stopwords', () => {
   const kws = extractKeywords('The build was not passing because of a WACC calculation issue');
@@ -64,4 +64,22 @@ test('backfillLesson derives keywords for a legacy entry with none, and it then 
   const ranked = rankLessons([backfilled], { description: 'Fix the WACC beta calculation' }, 3);
   assert.equal(ranked.length, 1);
   assert.equal(ranked[0].id, 'mem-1');
+});
+
+test('dedupeLessons collapses entries sharing a topic key, newest wins', () => {
+  const memory = [
+    { id: 'a', files: ['x.js'], lesson: 'old lesson' },
+    { id: 'b', keywords: ['unrelated'] },
+    { id: 'c', files: ['x.js'], lesson: 'newer lesson' }, // same topic key as 'a'
+  ];
+  const { kept, removed } = dedupeLessons(memory);
+  assert.deepEqual(kept.map((e) => e.id), ['b', 'c']);
+  assert.deepEqual(removed.map((e) => e.id), ['a']);
+});
+
+test('dedupeLessons is a no-op when every entry has a distinct topic', () => {
+  const memory = [{ id: 'a', files: ['x.js'] }, { id: 'b', files: ['y.js'] }];
+  const { kept, removed } = dedupeLessons(memory);
+  assert.equal(kept.length, 2);
+  assert.equal(removed.length, 0);
 });

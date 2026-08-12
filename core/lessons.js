@@ -50,6 +50,24 @@ export function backfillLesson(entry) {
   return { ...entry, keywords: extractKeywords(text), files: Array.isArray(entry.files) ? entry.files : [] };
 }
 
+// Step 12: collapses entries sharing a lessonTopicKey — the same "supersede"
+// rule recordLesson already applies going forward (see server.js), run once
+// retroactively over the whole backlog. Newest (last in array order, which
+// is append order) wins; everything else comes back as `removed` so the
+// caller can archive it rather than silently drop it.
+export function dedupeLessons(memory) {
+  const list = Array.isArray(memory) ? memory : [];
+  const lastIndexByKey = new Map();
+  list.forEach((entry, i) => lastIndexByKey.set(lessonTopicKey(entry), i));
+  const kept = [];
+  const removed = [];
+  list.forEach((entry, i) => {
+    if (lastIndexByKey.get(lessonTopicKey(entry)) === i) kept.push(entry);
+    else removed.push(entry);
+  });
+  return { kept, removed };
+}
+
 // Ranks `memory` entries against `ctx` — a single task, or (for the
 // splitter) an array of candidate tasks — by keyword/file overlap. Returns
 // [] when nothing overlaps at all.
