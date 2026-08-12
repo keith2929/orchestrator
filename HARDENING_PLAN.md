@@ -20,7 +20,7 @@
 - [x] Step 8 — Project-scope `logs/` and `error_logs/`
 - [x] Step 9 — Bound worker context
 - [x] Step 10 — Workers cannot mutate the knowledge base
-- [ ] Step 11 — Recipes as versioned files
+- [x] Step 11 — Recipes as versioned files
 - [ ] Step 12 — Lesson compaction into recipes
 - [ ] Step 13 — Smoke tests
 - [ ] Step 14 — Hygiene and local-only lockdown
