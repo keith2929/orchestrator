@@ -24,7 +24,7 @@
 - [x] Step 12 — Lesson compaction into recipes
 - [x] Step 13 — Smoke tests
 - [x] Step 14 — Hygiene and local-only lockdown
-- [ ] Step 15 — Documentation
+- [x] Step 15 — Documentation
 
 ## Goal
 
