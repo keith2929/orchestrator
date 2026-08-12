@@ -21,6 +21,14 @@ import { readTaskState, setTaskState, runningEntries, classifyInterrupted, endAt
 import crypto from 'node:crypto';
 import { extractKeywords, lessonTopicKey, rankLessons, backfillLesson } from './core/lessons.js';
 import { formatSessionContextBlock, rolloverContent, windowPlannerChat } from './core/sessionContext.js';
+import { substituteParams } from './core/recipeExpand.js';
+import {
+  writeCandidate,
+  approveCandidate,
+  reconcileIndex,
+  resolveActiveVersion,
+  recordEvidence,
+} from './core/recipeStore.js';
 
 // Load .env into process.env FIRST — before any module below captures a snapshot
 // of the environment (e.g. shared.js CHILD_ENV) or reads a key. env.js loads on
@@ -249,45 +257,73 @@ function getConfig() {
 // whether a recipe node arrived via the API or a hand-edited tasks.json.
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
-// Phase 9: project-local custom recipes — human-approved proposals mined
-// from THIS project's own history (see graph/recipeMiner.js + the curator
-// role), stored as pure declarative data at
-// <targetDir>/.orchestrator/recipes.json. Built-in recipes (graph/recipes/)
-// still win on id collision — they ship with the codebase and are reviewed
-// by a human at authoring time, not runtime.
+// Step 11: project-local custom recipes are versioned, hand-editable files
+// under <targetDir>/.orchestrator/recipes/ (core/recipeStore.js) instead of
+// opaque rows in recipes.json — see HARDENING_PLAN.md step 11 for the file
+// format and the candidate -> approve -> published lifecycle. Built-in
+// recipes (graph/recipes/) still win on id collision — they ship with the
+// codebase and are reviewed by a human at authoring time, not runtime.
 // ---------------------------------------------------------------------------
-function readCustomRecipes(cwd) {
-  const file = path.join(cwd, '.orchestrator', 'recipes.json');
-  const list = readJson(file, []);
-  return Array.isArray(list) ? list : [];
-}
-function writeCustomRecipes(cwd, list) {
-  const file = path.join(cwd, '.orchestrator', 'recipes.json');
-  writeJson(file, list);
+function recipesDirFor(cwd) {
+  const dir = path.join(cwd, '.orchestrator', 'recipes');
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+  } catch {
+    /* best-effort */
+  }
+  migrateLegacyRecipesJson(cwd, dir);
+  return dir;
 }
 
-// Mechanically turns a curator-proposed step's args into concrete values by
-// substituting "{{paramName}}" inside string values — NEVER eval, never a
-// model-authored function body. A param with no supplied value leaves its
-// placeholder untouched rather than guessing.
-function substituteParams(value, params) {
-  if (typeof value === 'string') {
-    return value.replace(/\{\{(\w+)\}\}/g, (m, name) => (name in params ? String(params[name]) : m));
+// One-time migration: legacy recipes.json rows become v1.md files. No-ops
+// once the legacy file is gone (renamed after a successful migration so this
+// never re-runs and never re-imports something a human since deprecated).
+function migrateLegacyRecipesJson(cwd, recipesDir) {
+  const legacyPath = path.join(cwd, '.orchestrator', 'recipes.json');
+  let legacy;
+  try {
+    legacy = JSON.parse(fs.readFileSync(legacyPath, 'utf8'));
+  } catch {
+    return; // already migrated, or never existed
   }
-  if (Array.isArray(value)) return value.map((v) => substituteParams(v, params));
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, substituteParams(v, params)]));
+  if (!Array.isArray(legacy) || !legacy.length) {
+    try {
+      fs.renameSync(legacyPath, `${legacyPath}.migrated`);
+    } catch {
+      /* best-effort */
+    }
+    return;
   }
-  return value;
+  for (const r of legacy) {
+    if (!r || !r.id || !Array.isArray(r.steps)) continue;
+    const destDir = path.join(recipesDir, r.id);
+    if (fs.existsSync(path.join(destDir, 'v1.md'))) continue; // already migrated
+    try {
+      const { path: candidatePath } = writeCandidate(recipesDir, {
+        id: r.id,
+        description: r.description || '',
+        steps: r.steps,
+        onFailureHint: r.onFailureHint || '',
+      });
+      const version = Number(/\.v(\d+)\.md$/.exec(candidatePath)[1]);
+      approveCandidate(recipesDir, r.id, version);
+    } catch {
+      /* best-effort — a bad legacy row is skipped, not fatal */
+    }
+  }
+  try {
+    fs.renameSync(legacyPath, `${legacyPath}.migrated`);
+  } catch {
+    /* best-effort */
+  }
 }
 
-// Built-ins first, then this project's own approved recipes. A custom
-// recipe's `expand` is mechanically constructed here from its stored
-// `steps` — the registry, not the model, turns data into code.
+// Built-ins first, then this project's own approved recipes (the ACTIVE
+// published version — see core/recipeStore.js's reconcileIndex).
 function getRecipeForProject(id, cwd) {
   const builtin = getRecipe(id);
   if (builtin) return builtin;
-  const custom = readCustomRecipes(cwd).find((r) => r.id === id);
+  const custom = resolveActiveVersion(recipesDirFor(cwd), id, recipeList.map((r) => r.id));
   if (!custom) return null;
   return {
     ...custom,
@@ -1060,9 +1096,10 @@ async function handleMineRecipes(res) {
 
 // POST /api/recipes/approve — the human-approval gate. Body: { recipe: {
 // id, description, params?, steps, onFailureHint? } } (a proposal from
-// POST /api/recipes/mine, possibly hand-edited first). Landing a recipe is
-// just appending validated data to this project's recipes.json — nothing
-// executable is ever written.
+// POST /api/recipes/mine, possibly hand-edited first). Writes a NEW
+// candidate file and immediately moves it to published — the structural
+// gate (step 11) is that a candidate is never resolvable UNTIL this move
+// happens; the API keeps the same single-call shape callers already use.
 async function handleApproveRecipe(req, res) {
   const body = await readBody(req);
   const proposal = body.recipe;
@@ -1086,30 +1123,50 @@ async function handleApproveRecipe(req, res) {
   }
 
   const cwd = getConfig().targetDir || process.cwd();
-  const list = readCustomRecipes(cwd).filter((r) => r.id !== id); // supersede a same-id re-approval
-  const saved = {
+  const recipesDir = recipesDirFor(cwd);
+  const cleanSteps = steps.map((s) => ({ tool: s.tool, args: s.args && typeof s.args === 'object' ? s.args : {} }));
+  const { path: candidatePath } = writeCandidate(recipesDir, {
     id,
     description: proposal.description || '(no description)',
-    params: proposal.params && typeof proposal.params === 'object' ? proposal.params : {},
-    steps: steps.map((s) => ({ tool: s.tool, args: s.args && typeof s.args === 'object' ? s.args : {} })),
+    steps: cleanSteps,
     onFailureHint: proposal.onFailureHint || '',
-    approvedAt: new Date().toISOString(),
-  };
-  list.push(saved);
-  writeCustomRecipes(cwd, list);
-  sendJson(res, 200, { recipe: saved });
+  });
+  const version = Number(/\.v(\d+)\.md$/.exec(candidatePath)[1]);
+  const { record } = approveCandidate(recipesDir, id, version);
+  sendJson(res, 200, { recipe: record });
 }
 
 function handleGetRecipes(res) {
   const cwd = getConfig().targetDir || process.cwd();
+  const recipesDir = recipesDirFor(cwd);
+  const builtinIds = recipeList.map((r) => r.id);
   const builtins = recipeList.map((r) => ({ id: r.id, description: r.description, source: 'built-in' }));
-  const custom = readCustomRecipes(cwd).map((r) => ({
-    id: r.id,
-    description: r.description,
-    source: 'custom',
-    approvedAt: r.approvedAt,
+
+  const { entries, candidates } = reconcileIndex(recipesDir, builtinIds);
+  const custom = [];
+  for (const [id, entry] of Object.entries(entries)) {
+    for (const [version, v] of Object.entries(entry.versions)) {
+      custom.push({
+        id,
+        version: Number(version),
+        description: v.record ? v.record.description : undefined,
+        source: 'custom',
+        status: v.status,
+        derived: v.derived || null,
+        approvedAt: v.record ? v.record.approvedAt : undefined,
+        confidence: v.record ? v.record.confidence : undefined,
+        error: v.error,
+      });
+    }
+  }
+  const candidateRows = Object.values(candidates).map((c) => ({
+    id: c.record ? c.record.id : null,
+    version: c.record ? c.record.version : null,
+    source: 'candidate',
+    status: c.status,
+    error: c.error,
   }));
-  sendJson(res, 200, { recipes: [...builtins, ...custom] });
+  sendJson(res, 200, { recipes: [...builtins, ...custom, ...candidateRows] });
 }
 
 // ---------------------------------------------------------------------------
